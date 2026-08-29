@@ -17,3 +17,43 @@ AWS::IAM::Role requires AssumeRolePolicyDocument only.
 AWS::EC2::VPC requires nothing.
 AWS::RDS::DBCluster requires nothing.
 AWS::ECS::Cluster requires nothing.
+
+### day 4
+Client (internet)
+   |
+   | :443 HTTPS   <-- the ONLY arrow exposed to the public internet
+   v
+┌─────────────── PUBLIC SUBNET ───────────────┐
+│  [Route 53]  — DNS only: resolves the domain │
+│       |         to the ALB's DNS name        │
+│       | :443                                 │
+│       v                                      │
+│  [ALB]  — HTTPS listener, terminates TLS     │
+│  (ACM cert lives here)                       │
+│       |                                      │
+│  [WAFv2 Web ACL attached to the ALB]         │
+│  — inspects the request, blocks bad ones     │
+│  BEFORE it reaches a target                  │
+│       |                                      │
+│  [Target Group] — routing list, forwards     │
+│  healthy requests to registered tasks        │
+└───────|───────────────────────────────────────┘
+        | :8080 (app port)
+        v
+┌─────────────── PRIVATE SUBNET ──────────────┐
+│  [ECS/Fargate task: api]  <- this IS snip    │
+│       |                  \                   │
+│       | :5432              | :6379           │
+│       v                    v                 │
+│  [RDS Postgres]      [ElastiCache Redis]     │
+│  (links table)        (cached GET /:code)    │
+└───────────────────────────────────────────────┘
+
+Scheduled job — NOT on the request path, no arrow from ALB:
+
+[EventBridge Scheduler] --cron--> [ECS/Fargate task: job] (private subnet)
+                                          |
+                                          | :5432
+                                          v
+                                    [RDS Postgres]
+                        (rolls up click_count, deletes expired links)
