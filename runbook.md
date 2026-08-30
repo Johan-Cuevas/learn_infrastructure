@@ -57,3 +57,18 @@ Scheduled job — NOT on the request path, no arrow from ALB:
                                           v
                                     [RDS Postgres]
                         (rolls up click_count, deletes expired links)
+
+### day 5
+commit -> CircleCI (checks/tests) -> docker build -> push image -> ECR
+                                                                    |
+                                                                    (shared artifact, tagged by commit SHA)
+
+(deploy to dev) CFN template -> S3 -> Step Functions -> Cloud Formation -> ECS update (dev)
+                                |
+                            manual approval
+                                | 
+(deploy to stage) CFN template -> S3 -> Step Functions -> Cloud Formation -> ECS update (stage)
+
+2. Manual approval gate is inside CircleCI workflow after deb job suceeds before teh stage deploy can start.
+3. credentials needed when pusing to ECR, CFN to S3, executing step function, CloudFormation and ECS service. CircleCI needs IAM role for every step. It needs to touch aws once it reaches the push to ECR.
+4. Failsure show up in CI log, S3, CFN events and ECS Events.
