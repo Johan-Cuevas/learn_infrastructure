@@ -72,3 +72,20 @@ commit -> CircleCI (checks/tests) -> docker build -> push image -> ECR
 2. Manual approval gate is inside CircleCI workflow after deb job suceeds before teh stage deploy can start.
 3. credentials needed when pusing to ECR, CFN to S3, executing step function, CloudFormation and ECS service. CircleCI needs IAM role for every step. It needs to touch aws once it reaches the push to ECR.
 4. Failsure show up in CI log, S3, CFN events and ECS Events.
+
+
+
+### Week 2
+
+
+### day 1
+2. Since we end in /16 then we have 2^(32-16) ip addresses.
+3. To split into four blocks
+10.0.0.0/24, 10.0.1.0/24, 10.0.2.0/24, 10.0.3.0/24
+4. Two are public two are private
+
+10.0.0.0/24 (public, us-east-1a) 
+10.0.1.0/24 (public, us-east-1b) 
+10.0.2.0/24 (private, us-east-1a)
+10.0.3.0/24 (private, us-east-1b)
+5. Each block has 251 usable ip addresses because every block has network address, VPC router, DNS, future use, broadcast set aside.
