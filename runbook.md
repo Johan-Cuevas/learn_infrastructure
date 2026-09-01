@@ -89,3 +89,7 @@ commit -> CircleCI (checks/tests) -> docker build -> push image -> ECR
 10.0.2.0/24 (private, us-east-1a)
 10.0.3.0/24 (private, us-east-1b)
 5. Each block has 251 usable ip addresses because every block has network address, VPC router, DNS, future use, broadcast set aside.
+
+
+### day 3
+6. The Application load balancer security group is open to the internet to receive requests from any ip address. The task security group only needs to information from the previous security group as the information should go through the first security group to ensure only one listens to the internet.
