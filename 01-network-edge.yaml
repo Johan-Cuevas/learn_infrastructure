@@ -1,4 +1,22 @@
 AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  CreateVpcEndpoints:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Whether to create the VPC endpoints (S3 gateway + ECR/logs/secretsmanager interface endpoints). Set to false to tear them down nightly and save the hourly interface-endpoint cost.
+  CreateAlb:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Whether to create the ALB, target group, and listener. Set to false to tear it down nightly and save the ALB hourly cost.
+Conditions:
+  ShouldCreateVpcEndpoints: !Equals [!Ref CreateVpcEndpoints, 'true']
+  ShouldCreateAlb: !Equals [!Ref CreateAlb, 'true']
 Resources:
   myVPC:
     Type: AWS::EC2::VPC
@@ -88,6 +106,7 @@ Resources:
           SourceSecurityGroupId: !Ref ALBSecurityGroup
   myLoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: ShouldCreateAlb
     Properties:
       Subnets:
         - !Ref PublicSubnetOne
@@ -96,6 +115,7 @@ Resources:
         - !Ref ALBSecurityGroup
   myTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: ShouldCreateAlb
     Properties:
       Name: my-target-group
       Protocol: HTTP
@@ -104,11 +124,97 @@ Resources:
       VpcId: !Ref myVPC
   ngixListener:
     Type: 'AWS::ElasticLoadBalancingV2::Listener'
-    Properties: 
+    Condition: ShouldCreateAlb
+    Properties:
       LoadBalancerArn: !Ref myLoadBalancer
       Protocol: HTTP
       Port: 80
       DefaultActions:
         - Type: forward
           TargetGroupArn: !Ref myTargetGroup
-  
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref myVPC
+  PrivateSubnetOneRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetOne
+      RouteTableId: !Ref PrivateRouteTable
+  PrivateSubnetTwoRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetTwo
+      RouteTableId: !Ref PrivateRouteTable
+  VpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      GroupDescription: Allow HTTPS from ECS tasks to VPC endpoints
+      VpcId: !Ref myVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref TaskSecurityGroup
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcId: !Ref myVPC
+      VpcEndpointType: Gateway
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcId: !Ref myVPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.api
+      SubnetIds:
+        - !Ref PrivateSubnetOne
+        - !Ref PrivateSubnetTwo
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+      PrivateDnsEnabled: true
+  EcrDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcId: !Ref myVPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.dkr
+      SubnetIds:
+        - !Ref PrivateSubnetOne
+        - !Ref PrivateSubnetTwo
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+      PrivateDnsEnabled: true
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcId: !Ref myVPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.logs
+      SubnetIds:
+        - !Ref PrivateSubnetOne
+        - !Ref PrivateSubnetTwo
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+      PrivateDnsEnabled: true
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcId: !Ref myVPC
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      SubnetIds:
+        - !Ref PrivateSubnetOne
+        - !Ref PrivateSubnetTwo
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+      PrivateDnsEnabled: true
