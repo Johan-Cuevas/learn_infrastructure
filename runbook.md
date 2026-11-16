@@ -112,3 +112,46 @@ Cannot pull container error that shows up in ECS stopped-task reason. Task place
 5. The root cause was taht ht e private subnet has no access to the internet since ECR is  a public endpoint it has no way to reach it. Solution use a NAT Gateway or VPC  endpoint.
 NAT Gateway .045/hr + data processing
 Interface endpoints .01/hr for each AZ.
+
+
+### Week 3 
+
+### Day 1
+1. Effect, action, resource, condition, the optional one is condition.
+2. 
+{
+   "Version": "2012-10-17",
+   "Statement": [
+      {
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::my-bucket/config/*"
+      }
+   ]
+}
+
+3. 
+{
+   "Version": "2012-10-17",
+   "Statement" : [
+      {
+         "Effect": "Allow",
+         "Action": "secretsmanager:GetSecretValue",
+         "Resource": "arn:aws:secretsmanager:us-east-1:123456789123:secret:dev/api/demo-AbC123"
+      }
+   ]
+}
+
+4.
+{
+   "Version": "2012-10-17",
+   "Statement": [
+      {
+         "Effect": "Allow",
+         "Action": "s3:GetObject",
+         "Resource": "arn:aws:s3:::my-bucket/config/*",
+         "Condition": {"Bool" : {"aws:SecureTransport": "true"}}
+      }
+   ]
+}
+

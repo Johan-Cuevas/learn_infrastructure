@@ -35,10 +35,10 @@ A link shortener is the right choice because it exercises exactly the four thing
 | Piece | Detail |
 |---|---|
 | **API** (Go) | `POST /links {"url": "..."}` → `201 {"code": "aB3x9"}` · `GET /:code` → `302` redirect + increment a click counter · `GET /healthz` → `200` (no auth, no DB dependency for liveness) |
-| **Job** (Python) | Runs on a cron: aggregates click counts into a rollup table, deletes links past their `expires_at`, exits `0` |
-| **Data** | One table: `links(code PK, url, created_at, expires_at, click_count)`. One rollup table. That's it — no users, no auth, no analytics dashboard. |
+| **Job** (Python) | Runs on a cron: for each link, upserts today's `click_count` into `click_rollups`, deletes links past their `expires_at`, prints both counts, exits `0` (non-zero on any error) |
+| **Data** | Two tables, defined in one `schema.sql` file in the repo using `CREATE TABLE IF NOT EXISTS`: `links(code TEXT PRIMARY KEY, url TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), expires_at TIMESTAMPTZ, click_count INT NOT NULL DEFAULT 0)` and `click_rollups(code TEXT, day DATE, clicks INT, PRIMARY KEY (code, day))`. The API runs `schema.sql` on startup (Go's `embed` package makes this one line), so a fresh database never needs a manual setup step. That's it — no users, no auth, no analytics dashboard. |
 | **Cache** | Redis, cache-aside on `GET /:code` only, with a TTL |
-| **Config** | Everything from env vars: `PORT`, `DATABASE_URL` (or discrete `DB_*`), `REDIS_ADDR`. The DB credentials arrive from Secrets Manager in week 8 — write the code so it reads them at connect time, not once at boot. |
+| **Config** | Everything from env vars: `PORT`, `DATABASE_URL`, `REDIS_ADDR`. **If `DATABASE_URL` is unset, the API falls back to its in-memory map. If `REDIS_ADDR` is unset, it skips caching.** Week 5 deploys `snip` before any database exists, and this fallback is what lets it run. In week 8, `DATABASE_URL` is replaced by `DB_SECRET_ARN`: the API fetches the credentials from Secrets Manager **each time it opens a new connection**, not once at boot. |
 | **Port** | Listen on `0.0.0.0:${PORT}`, default `8080`. Never `127.0.0.1` — week 4 Day 5 shows you why. |
 
 **Why Go for the API:** a static binary in a distroless image is ~15 MB, builds in seconds, and makes week 4's multi-stage build lesson land properly. **Why Python for the job:** it makes the image-weight contrast obvious, and it's what most scheduled tasks are written in anyway. If you're not fluent in Go, that's fine — the API is under 200 lines and the day-by-day steps tell you exactly what it must do. The app is a prop; budget your struggle for the infrastructure.
@@ -97,7 +97,10 @@ Ranked by how often it's the answer to "why is this broken?":
 
 1. **Create a personal AWS sandbox account** — brand new, separate from anything else you own, with its own email alias.
    *Check:* you can sign in and the account has zero existing resources.
-2. **Turn on cost guardrails before creating any resource:** a $20/month AWS Budget alerting at 50/80/100%, a billing alarm in CloudWatch, and a bookmark to Billing → Cost Explorer "by service".
+2. **Turn on cost guardrails before creating any resource.** You need three things:
+   - a $20/month AWS Budget alerting at 50/80/100%
+   - a CloudWatch billing alarm: first turn on Billing → Billing preferences → **Receive CloudWatch billing alerts**, then create an alarm on `EstimatedCharges` > $20. Billing metrics only exist in **us-east-1**, so switch the console to that region first.
+   - a bookmark to Billing → Cost Explorer, grouped by service
    *Check:* the budget lists your email under Alerts. Do this *first* — guardrails after the fact are how sandbox bills happen.
 3. **Install the tooling:** AWS CLI v2, Docker Desktop, Git, **Go 1.22+**, **Python 3.11+**, `psql`, `jq`, `cfn-lint`, `redis-cli`, and the Session Manager plugin (for ECS Exec).
    *Check:* every one of `aws --version`, `docker version`, `go version`, `python3 --version`, `psql --version`, `jq --version`, `cfn-lint --version`, `redis-cli --version`, `session-manager-plugin` runs without error. Fix any that don't now, not mid-week-5.
@@ -174,15 +177,32 @@ Everything in the left column is billed **per hour whether or not you use it**. 
 
 1. Log in as the **root** user and enable MFA on it (IAM → Security credentials → Multi-factor authentication → Assign MFA device).
    *Check:* sign out, sign back in as root — you are prompted for a code. This is the single most important security step in the whole plan. 
-2. Set two budgets (Billing → Budgets): a **$20/month** cost budget alerting at 50/80/100%, and a second **$1/month** budget alerting at 100%, both emailing you.
+2. Make sure two budgets exist (Billing → Budgets): a **$20/month** cost budget alerting at 50/80/100%, and a second **$1/month** budget alerting at 100%, both emailing you. (You made the $20 one in Prerequisites step 2. Only add the $1 one.)
    *Check:* both appear in the Budgets list with your email in "Alerts". You will **not** see one fire today — budgets evaluate roughly 3× a day. Day 3 checks your inbox. 
 3. Create an IAM user for daily use (IAM → Users → Create user), with console access and MFA enabled, and **no permissions attached yet**.
    *Check:* the user's Security credentials tab shows an MFA device; its Permissions tab is empty. (Done account_name: sandbox-learn)
 4. Create an IAM role named `Admin`: trusted entity = **AWS account → this account**, tick "Require MFA", permission = `AdministratorAccess`.
    *Check:* the role's Trust relationships tab shows `"AWS": "arn:aws:iam::<your-account-id>:root"` and a `aws:MultiFactorAuthPresent` condition. 
-5. Attach an inline policy to your IAM user allowing `sts:AssumeRole` on that role's ARN, then create an access key for the user and run `aws configure --profile sandbox-user`.
+5. Attach an inline policy to your IAM user (IAM → Users → your user → Permissions → Add permissions → **Create inline policy** → **JSON** tab) allowing `sts:AssumeRole` on that role's ARN:
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       { "Effect": "Allow", "Action": "sts:AssumeRole", "Resource": "arn:aws:iam::<your-account-id>:role/Admin" }
+     ]
+   }
+   ```
+   Then create an access key for the user (Security credentials → Create access key → "Command Line Interface") and run `aws configure --profile sandbox-user`, pasting in the key ID and secret when prompted.
    *Check:* `aws sts get-caller-identity --profile sandbox-user` returns an ARN ending in `:user/<your-user>`. 
-6. Add a `sandbox` profile to `~/.aws/config` with `role_arn` (the `Admin` role), `source_profile = sandbox-user`, `mfa_serial` (your MFA device ARN), and `region`.
+6. Add a `sandbox` profile to `~/.aws/config` (on Windows: `%USERPROFILE%\.aws\config`):
+   ```ini
+   [profile sandbox]
+   role_arn = arn:aws:iam::<your-account-id>:role/Admin
+   source_profile = sandbox-user
+   mfa_serial = arn:aws:iam::<your-account-id>:mfa/<your-mfa-device-name>
+   region = us-east-1
+   ```
+   Copy the `mfa_serial` value from your user's Security credentials tab. Use whichever region you plan to work in, and use it consistently for the rest of the plan.
    *Check:* `aws sts get-caller-identity --profile sandbox` prompts for an MFA code, then returns an ARN. **From here on, every command in this plan uses `--profile sandbox`.**
 7. In `runbook.md`, break down the ARN that last command returned, field by field: partition, service, account, resource type, role name, session name.
    *Check:* you can explain why it says `sts` and `assumed-role/Admin/<session>` rather than `iam` and `user/...` — you are not *being* the role, you are holding a temporary session issued by it.
@@ -200,8 +220,8 @@ Everything in the left column is billed **per hour whether or not you use it**. 
 
 **Day 3 — Build the resource-type vocabulary**
 
-1. Check your inbox for the $1 budget alert set up on Day 1.
-   *Check:* if it hasn't arrived and you *have* spent over $1, your alert email is wrong — fix it now, before you own real resources.
+1. Verify your budget alerts will actually reach you. The $1 budget only emails you once real spend passes $1, which it probably hasn't yet, so silence today is normal. Instead, open each budget and confirm the alert recipient is an address you read. Then check Billing → Bills: if month-to-date spend is already over $1 and no email came, the address is wrong.
+   *Check:* both budgets show the correct email under Alerts. Fix it now, before you own real resources.
 2. Open the [resource and property types reference](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-template-resource-type-ref.html) and note the naming shape: `AWS::Service::Resource`.
    *Check:* you can write the type for "an ECS service" from the pattern alone, without searching.
 3. For each of your four layers, list 3–6 resource types you'll eventually declare (e.g. network/edge: `AWS::EC2::VPC`, `AWS::EC2::Subnet`, `AWS::EC2::InternetGateway`, `AWS::EC2::RouteTable`, `AWS::ElasticLoadBalancingV2::LoadBalancer`).
@@ -214,7 +234,7 @@ Everything in the left column is billed **per hour whether or not you use it**. 
 **Day 4 — Draw the runtime architecture**
 
 1. On paper, draw the request path left to right: Route 53 → ALB (HTTPS listener, ACM cert) → WAFv2 → target group → ECS/Fargate tasks (api, web) → RDS + ElastiCache.
-   *Check:* every box has exactly one inbound arrow and the path has no gaps.
+   *Check:* you can follow the arrows from Route 53 to the database without a gap. (WAF is drawn as a box for clarity, but in reality it's attached *to* the ALB, inspecting requests before the ALB forwards them.)
 2. Label each arrow with its protocol and port (`:443`, `:80`, app port, `5432`, `6379`).
    *Check:* you can say which single arrow is the one exposed to the internet.
 3. Shade which boxes sit in **public** subnets and which in **private**.
@@ -265,7 +285,7 @@ A CIDR block like `10.0.0.0/16` is a range of IP addresses; the number after the
    *Check:* you can state how many addresses that is (65,536) without a calculator.
 3. Split it into four `/24` blocks: `10.0.0.0/24`, `10.0.1.0/24`, `10.0.2.0/24`, `10.0.3.0/24`.
    *Check:* no two blocks overlap, and all four fit inside `10.0.0.0/16`.
-4. Label them: two **public** (for the ALB) and two **private** (for Fargate tasks) — one public + one private per Availability Zone.
+4. Label them: two **public** (for the ALB) and two **private** (for Fargate tasks) — one public + one private per Availability Zone. Use real AZ names from your region. `aws ec2 describe-availability-zones --profile sandbox --query 'AvailabilityZones[].ZoneName'` lists them; take the first two (e.g. `us-east-1a`, `us-east-1b`).
    *Check:* each AZ has exactly one public and one private subnet. This is the minimum layout an ALB will accept (it requires two AZs).
 5. Next to each block, write its usable address count: 256 total − 5 reserved by AWS = **251 usable**.
    *Check:* you can name what those 5 reserved addresses are used for (network address, VPC router, DNS, future use, broadcast).
@@ -282,8 +302,8 @@ A CIDR block like `10.0.0.0/16` is a range of IP addresses; the number after the
    *Check:* `aws ec2 describe-subnets --profile sandbox` lists four subnets with your CIDRs.
 4. Add `AWS::EC2::InternetGateway` + `AWS::EC2::VPCGatewayAttachment`. Redeploy.
    *Check:* the VPC console shows an IGW in state `attached`.
-5. Add a public route table with a `0.0.0.0/0` route to the IGW, and associate it with your **two public subnets only**. Redeploy.
-   *Check:* the two private subnets still show the *main* route table with no internet route. If all four are public, you've mis-associated.
+5. Add a public route table with a `0.0.0.0/0` route to the IGW, and associate it with your **two public subnets only**. Also add a second, **private** route table with **no** routes of your own, and associate it with the two private subnets. You need it on Day 4: the S3 endpoint attaches to a route table, and CloudFormation can't reference the VPC's auto-created main route table. Redeploy.
+   *Check:* in the VPC console, the public subnets' route table has a `0.0.0.0/0 → igw-...` route, and the private subnets' route table has only the `local` route. If all four have an internet route, you've mis-associated.
 6. Open the stack's **Events** tab and read it top to bottom in creation order.
    *Check:* you can name one resource that waited on another and say why. That ordering *is* the dependency graph CloudFormation inferred from your `!Ref`s.
 
@@ -291,38 +311,61 @@ A CIDR block like `10.0.0.0/16` is a range of IP addresses; the number after the
 
 1. Add an ALB security group allowing inbound `:80` and `:443` from `0.0.0.0/0`. Redeploy.
    *Check:* the SG exists and has exactly two inbound rules.
-2. Add a task security group whose inbound rule references the **ALB security group ID** as its source (not a CIDR), on your app port.
+2. Add a task security group whose inbound rule references the **ALB security group ID** as its source (not a CIDR) on the app port. This week the app is nginx, which listens on **80**. (From week 5, `snip` uses 8080.)
    *Check:* the rule's source column shows `sg-...`, not an IP range. This is the pattern that makes tasks unreachable from anywhere but the ALB.
 3. Add `AWS::ElasticLoadBalancingV2::LoadBalancer` across your two **public** subnets with the ALB SG attached. Redeploy.
    *Check:* the ALB reaches state `active` and has a DNS name.
-4. Add a target group with `TargetType: ip` (required for Fargate's `awsvpc` networking) and a listener on `:80` forwarding to it.
+4. Add a target group (`Port: 80`, `Protocol: HTTP`, `TargetType: ip`, which Fargate's `awsvpc` networking requires) and a listener on `:80` whose default action forwards to it.
    *Check:* `curl http://<alb-dns-name>` returns **503**. That is the correct answer right now — the target group has no targets. A connection timeout instead means the ALB SG is wrong.
-5. Run a single `nginx` Fargate task in a public subnet, registered to the target group, and re-curl.
+5. Add the borrowed nginx pieces to the same template: an `AWS::ECS::Cluster`, the copied task definition, its execution role (see the forward-dependency note), and an `AWS::ECS::Service` with `DesiredCount: 1`, `LaunchType: FARGATE`, one **public** subnet, `AssignPublicIp: ENABLED`, the task SG, and a `LoadBalancers` entry (target group ARN, container name, container port 80). Give the service `DependsOn: <your listener>`, because ECS rejects a target group that isn't attached to a listener yet. Redeploy and re-curl. (It has to be a *service*: a one-off `aws ecs run-task` is never registered with a target group.)
    *Check:* you get the nginx welcome page. This is the first end-to-end request path you've built.
 6. Write in `runbook.md`: why the ALB SG is open to the world but the task SG is not.
    *Check:* your explanation uses the phrase "SG referencing another SG".
 
 **Day 4 — Break it on purpose (and solve private-subnet egress for good)**
 
-This is the longest day of the week — steps 1–4 are the breaks, steps 5–7 solve the one that matters. Split it across two sessions if you need to. Do the breaks one at a time and **restore each before starting the next**, so you only ever have one fault in play.
+This is the longest day of the week — steps 1–4 are the breaks, steps 5–8 solve the one that matters. Split it across two sessions if you need to. Do the breaks one at a time and **restore each before starting the next**, so you only ever have one fault in play. Make every break by editing the template and redeploying, not by clicking in the console.
 
-1. Delete the ALB→task rule from the task SG. Curl the ALB.
-   *Check:* 503, and the target group shows targets as `unhealthy`. Restore the rule; confirm it goes back to `healthy`.
-2. Point the target group at the wrong port (e.g. 8080 when nginx listens on 80). Curl.
-   *Check:* targets flip to `unhealthy` with reason "Health checks failed", and the ALB returns 502/503. Restore.
-3. Move the task into a **private** subnet (`AssignPublicIp: DISABLED`) and redeploy.
-   *Check:* the task never starts; the stopped-task reason contains `CannotPullContainerError`. This is the single most common Fargate failure, and it is a *networking* problem wearing an image-pull costume. **Leave it broken** — steps 5–7 fix it properly.
+1. Delete the ALB→task rule from the task SG. Wait about a minute (two failed health checks), then curl the ALB.
+   *Check:* the target group shows the target as `unhealthy`, and curl returns a 5xx, most likely **504** after a pause. When *every* target is unhealthy, the ALB "fails open" and tries them anyway, and the blocked connection times out. Restore the rule and confirm it goes back to `healthy`.
+2. Make the health check probe the wrong port: set `HealthCheckPort: 8080` on the target group (nginx listens on 80). Redeploy. (Changing the target group's `Port` won't do it, because the ECS service registers targets with its own container port.)
+   *Check:* the target flips to `unhealthy` with reason "Health checks failed". Restore.
+3. Move the task into a **private** subnet: in the service's `NetworkConfiguration`, swap the subnet for a private one and set `AssignPublicIp: DISABLED`. Redeploy.
+   *Check:* the task never starts; the stopped-task reason contains `CannotPullContainerError`. This is the single most common Fargate failure, and it is a *networking* problem wearing an image-pull costume. **Leave it broken** — steps 5–8 fix it properly.
 4. Write a `runbook.md` entry for each of the three in the Section 6 format: exact symptom string → cause → fix → how to prevent.
    *Check:* three entries, each with a verbatim error string you actually saw, not a paraphrase.
 5. Understand the actual problem before fixing it: a task in a private subnet has **no route to the internet**, and ECR, CloudWatch Logs, and Secrets Manager are all *public* endpoints. There are exactly two fixes — a **NAT Gateway** (route private traffic out through the public subnet) or **VPC endpoints** (bring the AWS APIs inside your VPC). Write both in `runbook.md` with their costs: NAT ≈ $0.045/hr plus data processing; interface endpoints ≈ $0.01/hr each per AZ; the S3 **gateway** endpoint is free.
    *Check:* you can state that for a sandbox this small, the hourly costs are comparable — **what actually bills you is leaving either one running**, not which you pick.
-6. Build the endpoint set (this is what production does, and it's the one most people get wrong). You need **five**, not two: an `AWS::EC2::VPCEndpoint` of type `Gateway` for **S3**, and four of type `Interface` for `ecr.api`, `ecr.dkr`, `logs`, and `secretsmanager` — each in your private subnets, with `PrivateDnsEnabled: true` and a security group allowing `:443` from the task SG.
+6. Build the endpoint set (this is what production does, and it's the one most people get wrong). You need **five**, not two:
+   - one `AWS::EC2::VPCEndpoint` with `VpcEndpointType: Gateway` for S3 (`ServiceName: !Sub com.amazonaws.${AWS::Region}.s3`), with `RouteTableIds` set to your **private route table** from Day 2
+   - four with `VpcEndpointType: Interface` for `ecr.api`, `ecr.dkr`, `logs`, and `secretsmanager` (`ServiceName: !Sub com.amazonaws.${AWS::Region}.<name>`), each with `SubnetIds` = your two private subnets, `PrivateDnsEnabled: true`, and `SecurityGroupIds` = a new **endpoint SG** allowing inbound `:443` from the task SG
+
    *Check:* five endpoints, and you can say why the S3 one is needed even though you never call S3 — **ECR stores image layers in S3**, so image pulls fail with only the two ECR endpoints. This is the exact trap.
-7. Redeploy the task into the private subnet.
+7. **Move the nginx image into your own ECR.** VPC endpoints reach *your* AWS account's ECR, not Docker Hub or ECR Public, so a private task still can't pull `nginx` from there. Run:
+   ```
+   aws ecr create-repository --repository-name nginx --profile sandbox
+   aws ecr get-login-password --profile sandbox | docker login --username AWS --password-stdin <acct>.dkr.ecr.<region>.amazonaws.com
+   docker pull --platform linux/amd64 nginx:latest
+   docker tag nginx:latest <acct>.dkr.ecr.<region>.amazonaws.com/nginx:1
+   docker push <acct>.dkr.ecr.<region>.amazonaws.com/nginx:1
+   ```
+   Then set the task definition's `Image` to that URI. (Week 5 explains all of this properly. Today it's just a prerequisite.)
+   *Check:* `aws ecr list-images --repository-name nginx --profile sandbox` shows tag `1`.
+8. Redeploy the task into the private subnet.
    *Check:* it starts, pulls its image, becomes `healthy`, and serves through the ALB — with no public IP and no NAT Gateway. Curl the ALB to confirm.
    *If it still fails:* check the endpoint security group allows 443 from the task SG, and that `PrivateDnsEnabled` is true — without it the task resolves the *public* ECR name and still has nowhere to go.
-8. Add a `CreateVpcEndpoints` parameter defaulting to `true`, so `teardown.sh` can drop them nightly.
-   *Check:* deploying with it `false` removes all five and the private task goes back to failing — which is now a symptom you recognize instantly.
+9. Make the endpoints switchable so `teardown.sh` can drop them nightly. Conditions are formally taught in week 6. For now, copy this pattern:
+   ```yaml
+   Parameters:
+     CreateVpcEndpoints:
+       Type: String
+       AllowedValues: ["true", "false"]
+       Default: "true"
+   Conditions:
+     ShouldCreateVpcEndpoints: !Equals [!Ref CreateVpcEndpoints, "true"]
+   ```
+   Then add `Condition: ShouldCreateVpcEndpoints` to each of the five endpoint resources, at the same indentation as `Type:`. Do the same for the ALB, its listener, its target group, and the ECS service, using a second parameter `CreateLoadBalancer` / condition `ShouldCreateLoadBalancer`.
+   *Check:* `aws cloudformation deploy ... --parameter-overrides CreateVpcEndpoints=false --profile sandbox` removes all five endpoints, and a private task goes back to failing, which is now a symptom you recognize instantly.
 
 **Day 5 — Teardown script**
 
@@ -330,7 +373,7 @@ This is the longest day of the week — steps 1–4 are the breaks, steps 5–7 
    *Check:* the list matches what you think you built. Anything unexpected is a resource you'll be billed for.
 2. Write `teardown.sh` that deletes stacks in **reverse** creation order, with `aws cloudformation wait stack-delete-complete` between each.
    *Check:* the script has the waits — without them the next delete starts before the previous finished and fails on in-use exports.
-3. Add a `--nightly` mode that deletes only the hourly-billed things (see the teardown rule in Section 3): compute, data, the ALB, and the VPC endpoints — leaving the VPC, subnets, IAM, and ECR in place.
+3. Add a `--nightly` mode that removes only the hourly-billed things (see the teardown rule in Section 3) and leaves the VPC, subnets, IAM, and ECR in place. This week everything lives in one stack, so "nightly" can't mean deleting a stack. Instead it **redeploys** `net-dev` with `--parameter-overrides CreateVpcEndpoints=false CreateLoadBalancer=false` (the toggles from Day 4 step 9). From week 6, when compute and data get their own stacks, `--nightly` also deletes `03-compute` and `02-data` outright.
    *Check:* after `./teardown.sh --nightly`, `aws elbv2 describe-load-balancers` and `aws ec2 describe-vpc-endpoints` both return empty, while your VPC survives. This is the command you'll run most nights for the next 10 weeks.
 4. Run the full teardown.
    *Check:* every stack reaches `DELETE_COMPLETE`.
@@ -351,58 +394,95 @@ This is the longest day of the week — steps 1–4 are the breaks, steps 5–7 
 
 **Project:** A Fargate task that reads a secret from Secrets Manager and an object from S3 — using least-privilege roles you wrote yourself. (Still the borrowed `nginx` task; `snip` arrives in week 4.)
 
-> **Forward dependency:** as in week 2, keep reusing the borrowed `nginx` task definition as a carrier — you're swapping the *roles* attached to it, not writing the task definition. Week 5 is where you write that from scratch. If you want to see a secret actually arrive in a container this week, run `nginx` with a shell (`amazonlinux` with `sleep 3600` as its command works well) and use ECS Exec, or just log the env var.
+> **Forward dependency, and the "probe" task you'll use all week:** nginx can't read a secret or call S3, so this week you add a second, throwaway task definition to `01-network-edge.yaml` called **`probe`**. It's a copy of your borrowed nginx task definition with three changes:
+> - `Image: amazon/aws-cli`
+> - `EntryPoint: ["sh", "-c"]`
+> - `Command: ["echo TOKEN=$TOKEN; aws s3 cp s3://<your-bucket>/config/app.json -; sleep 3600"]`
+>
+> You start it on demand with `aws ecs run-task --cluster <cluster> --task-definition probe --launch-type FARGATE --network-configuration 'awsvpcConfiguration={subnets=[<public-subnet-id>],securityGroups=[<task-sg-id>],assignPublicIp=ENABLED}' --profile sandbox`. Then you read its CloudWatch log stream (it needs the same `awslogs` `LogConfiguration` as nginx). Run it in a **public** subnet with a public IP, because `amazon/aws-cli` comes from Docker Hub and your VPC endpoints only cover *your* ECR. **Don't** attach it to the ECS service or the target group. It has no web server, so it would fail health checks. You'll write task definitions properly in week 5. This week you only change the roles attached to them.
 
 **Day 1 — Policy anatomy**
 
+Today's output is **three JSON files** in a new `iam/` folder in your repo: `iam/policy-a-s3-read.json`, `iam/policy-b-secret-read.json`, `iam/policy-c-s3-conditional.json`. "Hand-write" means type the JSON yourself in your editor. Don't use the console's visual policy editor and don't copy from the docs. Every IAM policy is a JSON document with this shape, and all three of yours start from it:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "<service>:<Action>",
+      "Resource": "<ARN>"
+    }
+  ]
+}
+```
+
+`"Version": "2012-10-17"` is a fixed string (the policy-language version, not today's date). Always use exactly that value.
+
 1. Read the "JSON policy document structure" section of the [IAM policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies.html) page.
    *Check:* you can name the four elements — Effect, Action, Resource, Condition — and say which one is optional.
-2. Hand-write policy (a): allow `s3:GetObject` on **one bucket and prefix only** (`arn:aws:s3:::my-bucket/config/*`).
-   *Check:* the Resource is an object ARN with `/*`, not the bucket ARN. Those are two different things and mixing them up is the classic first IAM bug.
-3. Hand-write policy (b): allow `secretsmanager:GetSecretValue` on **one secret ARN only**.
-   *Check:* your ARN ends with the 6-character suffix AWS appends to secret names — a truncated ARN silently matches nothing.
-4. Hand-write policy (c): allow `s3:GetObject` **only when** a condition matches (e.g. `aws:RequestTag` or `s3:prefix`).
-   *Check:* the Condition block is valid JSON and names a real condition key from the docs.
-5. Paste each into the IAM **Policy simulator** (console → IAM → Access management → Policy simulator) and test both a should-allow and a should-deny action.
-   *Check:* all three allow exactly what you intended and deny everything else. **If a policy allows more than you meant, fix it now** — this is the muscle the whole week trains.
+2. Write policy (a) in `iam/policy-a-s3-read.json`: allow `s3:GetObject` on **one bucket and prefix only**, with Resource `arn:aws:s3:::my-bucket/config/*`. `my-bucket` is a placeholder for today. The simulator doesn't need a real bucket. You'll swap in a real bucket name on Day 2.
+   *Check:* the Resource is an **object** ARN ending in `/config/*`, not the **bucket** ARN `arn:aws:s3:::my-bucket`. `GetObject` acts on objects, so a bucket ARN here matches nothing. Mixing the two up is the classic first IAM bug.
+3. Get a real secret ARN to write policy (b) against: run Day 3 step 1's `create-secret` command now (it costs cents) and copy the `ARN` it returns. Then write `iam/policy-b-secret-read.json`: allow `secretsmanager:GetSecretValue` with Resource set to **that full ARN**.
+   *Check:* your ARN ends with a `-` plus the 6 random characters AWS appended (e.g. `.../dev/api/demo-AbC123`). An ARN missing that suffix matches nothing, and AWS won't warn you.
+4. Write `iam/policy-c-s3-conditional.json`: the same statement as policy (a), plus a `Condition` block that allows the request **only over HTTPS**:
+   ```json
+   "Condition": { "Bool": { "aws:SecureTransport": "true" } }
+   ```
+   The block goes inside the statement, next to `Effect`/`Action`/`Resource`. (Keys like `s3:prefix` and `aws:RequestTag` exist but don't apply to `GetObject`: they belong to `ListBucket` and to tagging/create actions. A condition on a key the action never sends quietly never matches.)
+   *Check:* `jq . iam/policy-c-s3-conditional.json` parses without error, and you can find `aws:SecureTransport` in the [global condition keys](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-keys.html) page.
+5. Test each file in the IAM **Policy simulator** (console → IAM → Access management → Policy simulator, which opens `policysim.aws.amazon.com`). In the left pane, choose **Create New Policy** and paste in the file's contents. On the right, pick the service and action, expand the action, and fill in the **Resource** field. For (c), also set the `aws:SecureTransport` context key under **Simulation Settings**. Run these cases:
+   | Policy | Should be **allowed** | Should be **denied** |
+   |---|---|---|
+   | (a) | `s3:GetObject` on `arn:aws:s3:::my-bucket/config/app.json` | `s3:GetObject` on `arn:aws:s3:::my-bucket/other/app.json`; `s3:PutObject` on the allowed path |
+   | (b) | `GetSecretValue` on your secret's full ARN | `GetSecretValue` on any other secret ARN |
+   | (c) | `GetObject` on the allowed path with `aws:SecureTransport = true` | the same request with `aws:SecureTransport = false` |
+   *Check:* every row gives the result in its column. **If a policy allows more than you meant, fix it now.** This is the muscle the whole week trains. Commit the three files.
 
 **Day 2 — Execution role vs. task role**
 
 1. In `runbook.md`, write the one-line distinction: **execution role** = what ECS itself uses to pull the image and write logs, *before your code runs*. **Task role** = what *your code* uses at runtime.
    *Check:* your sentence contains the words "before your code runs".
-2. Write the **execution role** from scratch: trust policy with principal `ecs-tasks.amazonaws.com`, plus the managed policy `AmazonECSTaskExecutionRolePolicy`.
-   *Check:* the role's Trust relationships tab shows `ecs-tasks.amazonaws.com`. If it shows `ecs.amazonaws.com`, that's the wrong service principal and tasks will fail to launch.
-3. Write the **task role** from scratch: same trust policy, but attach *your* Day-1 policies (a) and (b) instead of the managed one.
+2. Make policy (a) real: create a bucket (`aws s3 mb s3://snip-config-<your-account-id> --profile sandbox`; the account ID makes the name globally unique), upload any small file to `config/app.json`, and change `my-bucket` in `iam/policy-a-s3-read.json` to your bucket name.
+   *Check:* `aws s3 ls s3://snip-config-<your-account-id>/config/ --profile sandbox` lists `app.json`.
+3. Write the **execution role** as an `AWS::IAM::Role` resource in `01-network-edge.yaml`, the template that already holds your borrowed nginx task definition. It replaces the role you copied in week 2. (Week 6 moves IAM into `00-bootstrap`.) Give it:
+   - an `AssumeRolePolicyDocument` (the **trust policy**, meaning who may assume the role) allowing principal `Service: ecs-tasks.amazonaws.com` to call `sts:AssumeRole`
+   - `ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy]`
+
+   The trust policy has the same Version/Statement/Effect/Action shape as your Day 1 JSON, written as YAML. CloudFormation accepts either.
+   *Check:* after deploying (step 5), the role's Trust relationships tab shows `ecs-tasks.amazonaws.com`. If it shows `ecs.amazonaws.com`, that's the wrong service principal and tasks will fail to launch.
+4. Write the **task role** the same way: an identical trust policy, but **no** managed policy. Instead, add a `Policies:` list with policy (a) and policy (b) pasted in as inline policies (each needs a `PolicyName` and a `PolicyDocument`).
    *Check:* the task role has zero ECR and zero CloudWatch Logs permissions. It doesn't need them — that's the point.
-4. Add both roles to your CloudFormation template as `AWS::IAM::Role` resources and deploy.
-   *Check:* stack `CREATE_COMPLETE`, and `aws iam get-role --role-name <task-role> --profile sandbox` returns your trust policy.
-5. Predict, in writing, which role each of these needs: pulling the image / writing a log line / reading a secret at boot / calling S3 from your handler.
+5. Point the `probe` task definition (see the forward-dependency note above) at both: `ExecutionRoleArn: !GetAtt <ExecutionRole>.Arn` and `TaskRoleArn: !GetAtt <TaskRole>.Arn`. Deploy.
+   *Check:* stack `UPDATE_COMPLETE`, and `aws iam get-role --role-name <task-role> --profile sandbox` returns your trust policy.
+6. Predict, in writing, which role each of these needs: pulling the image / writing a log line / reading a secret at boot / calling S3 from your handler.
    *Check:* you said execution, execution, execution, task. (Secrets injected via the task definition are fetched by the *execution* role — that one surprises everyone.)
 
 **Day 3 — Secrets Manager into a container**
 
-1. Create a secret: `aws secretsmanager create-secret --name /dev/api/demo --secret-string '{"token":"hello"}' --profile sandbox`.
-   *Check:* the command returns an ARN. Copy it — including the 6-char suffix.
-   > ⚠️ **The trap that will bite you next Monday:** deleting a secret doesn't delete it — it *schedules* deletion with a 7–30 day recovery window, and the name stays reserved. Rebuild your stack and you get `You can't create this secret because a secret with this name is already scheduled for deletion`. Always delete with `--force-delete-without-recovery`, and set `RecoveryWindowInDays: 0` on any `AWS::SecretsManager::Secret` in your templates. Add the force-delete to `teardown.sh` **now**, before it costs you a session.
-2. Grant `secretsmanager:GetSecretValue` on that exact ARN to your **execution** role.
+1. Create a secret: `aws secretsmanager create-secret --name /dev/api/demo --secret-string '{"token":"hello"}' --profile sandbox`. (If you already did this on Day 1, skip it and get the ARN back with `aws secretsmanager describe-secret --secret-id /dev/api/demo --profile sandbox`.)
+   *Check:* you have the ARN, including the 6-char suffix.
+   > ⚠️ **The trap that will bite you next Monday:** deleting a secret doesn't delete it — it *schedules* deletion with a 7–30 day recovery window, and the name stays reserved. Rebuild your stack and you get `You can't create this secret because a secret with this name is already scheduled for deletion`. Always delete from the CLI with `--force-delete-without-recovery`. For secrets that CloudFormation manages (week 8), check after a stack delete with `aws secretsmanager list-secrets --include-planned-deletion` that nothing is left pending. Add the force-delete to `teardown.sh` **now**, before it costs you a session.
+2. Grant `secretsmanager:GetSecretValue` on that exact ARN to your **execution** role. Do this with a `Policies:` entry on the execution role in the template, alongside its managed policy. It's the same statement as policy (b), now attached to a different role. (Day 2 put policy (b) on the task role. It can stay there, but this is the copy that matters for injection.)
    *Check:* the policy's Resource matches the full ARN from step 1.
-3. In the task definition, add a `secrets` block (**not** `environment`) mapping `TOKEN` to that secret ARN.
-   *Check:* the rendered task definition JSON has the value under `secrets`, and no plaintext token appears anywhere in your template or repo.
-4. Deploy and run the task; read the value from inside the container (log it once, or use `printenv`).
-   *Check:* the container sees `TOKEN=...`. If the task fails at startup with `ResourceInitializationError`, step 2's ARN is wrong.
+3. In the `probe` task definition's container definition, add a `Secrets` block (**not** `Environment`) with one entry: `Name: TOKEN`, `ValueFrom: <the secret ARN>`.
+   *Check:* `aws ecs describe-task-definition --task-definition probe --profile sandbox` shows the ARN under `secrets`, and no plaintext token appears anywhere in your template or repo.
+4. Deploy, start the task with the `run-task` command from the forward-dependency note, and open its log stream in CloudWatch.
+   *Check:* the log shows `TOKEN={"token":"hello"}` (the whole secret string, because you didn't select a JSON key) and the contents of `app.json`. If the task stops at startup with `ResourceInitializationError`, step 2's ARN is wrong. Stop the task when done: `aws ecs stop-task --cluster <cluster> --task <task-arn> --profile sandbox`.
 5. Look at the task definition in the console.
    *Check:* the secret shows as an ARN reference, not a value — confirm to yourself that anyone with console read access still can't see the secret.
 
 **Day 4 — Break it on purpose (the three AccessDenied flavors)**
 
-One fault at a time; restore before the next.
+One fault at a time; restore before the next. Make each change **in the template and redeploy**, not in the console. A console edit is drift (week 7), and your next deploy would silently undo it.
 
-1. Remove `ecr:GetAuthorizationToken` from the **execution** role. Redeploy the service.
-   *Check:* the task **never starts**; stopped reason is `CannotPullContainerError`. Restore.
-2. Remove `secretsmanager:GetSecretValue` from the **execution** role. Redeploy.
+1. You can't delete one action from an AWS-managed policy, so first swap the execution role's `AmazonECSTaskExecutionRolePolicy` for an inline policy that lists the same actions explicitly: `ecr:GetAuthorizationToken`, `ecr:BatchCheckLayerAvailability`, `ecr:GetDownloadUrlForLayer`, `ecr:BatchGetImage`, `logs:CreateLogStream`, `logs:PutLogEvents` (Resource `"*"`). Redeploy and confirm everything still works. Then delete `ecr:GetAuthorizationToken`, redeploy, and force new tasks: `aws ecs update-service --cluster <cluster> --service <nginx-service> --force-new-deployment --profile sandbox`. Use the **nginx service** for this break, not `probe`. Only an image stored in *your* ECR needs ECR permissions. Docker Hub images ignore them.
+   *Check:* the new task **never starts**; its stopped reason is `CannotPullContainerError`. Restore.
+2. Remove `secretsmanager:GetSecretValue` from the **execution** role. Redeploy, then start `probe` with `run-task`.
    *Check:* the task fails at *initialization* with `ResourceInitializationError: unable to pull secrets` — a different stage than #1. Restore.
-3. Remove the S3 permission from the **task** role. Redeploy and hit the endpoint that reads S3.
-   *Check:* the task **starts fine and stays running**, then throws `AccessDenied` at runtime in your app logs. Restore.
+3. Remove policy (a) (the S3 permission) from the **task** role. Redeploy, then start `probe` again.
+   *Check:* the task **starts fine and stays running** (it's sleeping), but its log shows the `aws s3 cp` line failing with `AccessDenied`. Restore.
 4. Write the discriminator in `runbook.md`: *never started* → execution role (ECR); *started then died at init* → execution role (secrets); *running but erroring* → task role.
    *Check:* three symptoms, three distinct answers, each tied to a lifecycle stage.
 5. Have someone (or your future self) show you just one of the three error strings.
@@ -416,8 +496,8 @@ One fault at a time; restore before the next.
    *Check:* the procedure never says "attach AdministratorAccess".
 3. Add the exact CLI commands you'd run first: `aws iam list-attached-role-policies`, `aws iam get-role-policy`, and the simulator.
    *Check:* you could paste these commands straight into a terminal during an incident.
-4. Run `./teardown.sh` and verify zero resources remain.
-   *Check:* `DELETE_COMPLETE` on every stack; no leftover roles matter (IAM roles are free, but delete them anyway to keep the account honest).
+4. Run `./teardown.sh`, then delete the two things you made outside CloudFormation this week: the bucket (`aws s3 rb s3://snip-config-<your-account-id> --force --profile sandbox`) and the secret (`aws secretsmanager delete-secret --secret-id /dev/api/demo --force-delete-without-recovery --profile sandbox`).
+   *Check:* `DELETE_COMPLETE` on every stack, and `aws s3 ls` and `aws secretsmanager list-secrets` show neither. (IAM roles are free, but delete any leftovers anyway to keep the account honest.)
 5. Commit the week's templates and runbook entries.
    *Check:* five days of green history.
 
@@ -450,7 +530,7 @@ One fault at a time; restore before the next.
 
 **Day 2 — Multi-stage build**
 
-1. Split the Dockerfile into a `builder` stage (full Go image) and a final stage (`gcr.io/distroless/static` or `alpine`), copying only the compiled binary across.
+1. Split the Dockerfile into a `builder` stage (full Go image) and a final stage (`gcr.io/distroless/static` or `alpine`), copying only the compiled binary across. Build it as `docker build -t api:v2 .`. Week 5 pushes `api:v2`.
    *Check:* `docker build` succeeds and the app still serves `/healthz`.
 2. Add `CGO_ENABLED=0` and `GOOS=linux` to the build.
    *Check:* the binary runs in distroless. If you get "no such file or directory" running a binary that clearly exists, that's dynamic linking — this flag is the fix.
@@ -465,27 +545,34 @@ One fault at a time; restore before the next.
 
 **Day 3 — The Python job**
 
-1. Write the job to the Section 0.5 contract: connect to Postgres, roll up `click_count` into the rollup table, `DELETE` links past `expires_at`, print what it did, exit `0`.
-   *Check:* it runs locally against nothing gracefully, or fails loudly with a clear message — no silent exits.
+1. Write `schema.sql` from the Section 0.5 Data row. Then write the job to the Section 0.5 contract: read `DATABASE_URL`, connect to Postgres (`psycopg` is the usual library), upsert into `click_rollups`, `DELETE` links past `expires_at`, print what it did, exit `0`.
+   *Check:* run it with no database available (`DATABASE_URL` pointing at nothing). It must fail **loudly**, with a message naming the problem ("could not connect to …"), not exit silently.
 2. Make it exit non-zero on failure.
    *Check:* force an error; `echo $?` prints something other than 0. Scheduled tasks that swallow errors are invisible outages.
 3. Write its Dockerfile (slim base, `pip install -r requirements.txt` as its own layer before copying source).
    *Check:* changing job source doesn't re-run `pip install`.
 4. Build and compare sizes against the Go image.
    *Check:* write down both numbers and one sentence on why the Python one is heavier (interpreter + wheels vs. a static binary).
-5. Run the job in the container end to end.
-   *Check:* it exits 0 and prints what it did.
+5. Run the job in the container against a throwaway Postgres:
+   ```
+   docker run -d --name pg-tmp -e POSTGRES_PASSWORD=dev -p 5432:5432 postgres:16
+   psql -h localhost -U postgres -f schema.sql          # password: dev
+   docker run --rm -e DATABASE_URL=postgresql://postgres:dev@host.docker.internal:5432/postgres <job-image>
+   docker rm -f pg-tmp
+   ```
+   (`host.docker.internal` is how a container reaches a port on your own machine. `localhost` inside a container means the container itself.)
+   *Check:* it exits 0 and prints what it did (zero rows is fine — the tables are empty).
 
 **Day 4 — docker-compose: the full local stack**
 
-1. Write `docker-compose.yml` with a `postgres` service, a named volume, and `POSTGRES_PASSWORD`.
+1. Write `docker-compose.yml` with a `postgres` service (`image: postgres:16`), a named volume mounted at `/var/lib/postgresql/data`, `POSTGRES_PASSWORD`, and `ports: ["5432:5432"]` so your laptop can reach it.
    *Check:* `docker compose up postgres`, then `psql -h localhost -U postgres` connects.
 2. Add a `redis` service.
    *Check:* `redis-cli -h localhost ping` returns `PONG`.
 3. Add healthchecks to both, and `depends_on: { condition: service_healthy }` on the API.
    *Check:* `docker compose ps` shows `healthy`, and the API doesn't start until they are. Plain `depends_on` without the condition waits for *start*, not *ready* — that difference causes flaky boots.
-4. Create the `links` and rollup tables from Section 0.5, and point `snip` at Postgres and Redis via env vars (**service names as hostnames**, not `localhost` — that's the compose-networking gotcha).
-   *Check:* `docker compose up` brings the whole stack up, `POST /links` persists a row you can see with `psql`, and running the Python job deletes a link you gave a past `expires_at`.
+4. Replace the in-memory map with Postgres **when `DATABASE_URL` is set** (keep the map as the fallback; see Section 0.5 Config). Make the API run `schema.sql` on startup. Add `api` and `job` services to the compose file, and point both at Postgres and Redis via env vars, e.g. `DATABASE_URL=postgresql://postgres:<pw>@postgres:5432/postgres` and `REDIS_ADDR=redis:6379`. Use **service names as hostnames**, not `localhost` — that's the compose-networking gotcha.
+   *Check:* `docker compose up` brings the whole stack up, and `POST /links` persists a row you can see with `psql`. Then set a past `expires_at` on that row (`UPDATE links SET expires_at = now() - interval '1 day';`) and run `docker compose run --rm job`. The row is gone.
 5. Restart the stack.
    *Check:* your link is still there — the named volume worked.
 
@@ -497,8 +584,10 @@ One at a time; fix before the next.
    *Check:* connection refused even though the container is healthy and logs look perfect. **Memorize this symptom** — it's the #1 cause of ALB 502s in week 5.
 2. Remove a required env var from the compose file.
    *Check:* note whether the app crashes loudly or starts and misbehaves. Make it crash loudly, on boot, with the variable's name in the message.
-3. On Apple Silicon, build without `--platform linux/amd64` and try to run it as if on Fargate.
-   *Check:* `exec format error`. Then rebuild with `--platform linux/amd64` and confirm it works.
+3. See the architecture trap. Fargate runs `linux/amd64` by default.
+   - **On Apple Silicon:** build without `--platform linux/amd64`, then run the image with `docker run --platform linux/amd64 ...` to mimic Fargate.
+   - **On Windows or Intel:** do the reverse. Build with `--platform linux/arm64`, then inspect it with `docker image inspect <image> --format '{{.Architecture}}'`. (Docker Desktop's emulation may run it anyway, but Fargate won't.)
+   *Check:* you've seen `exec format error`, or confirmed the image architecture doesn't match `amd64`. Then rebuild with `--platform linux/amd64` and confirm it works. From here on, **always** build with `--platform linux/amd64`.
 4. Write all three into `runbook.md` with verbatim error strings.
    *Check:* three entries; the bind-address one includes the phrase "logs look fine".
 5. `docker compose down -v`, then `up` again.
@@ -514,6 +603,8 @@ One at a time; fix before the next.
 
 **Project:** `snip` running as an ECS service behind the week-2 ALB, plus its Python job as an EventBridge-scheduled task.
 
+> **Where this week's resources go:** put everything you write this week in a **new** template, `03-compute.yaml`, deployed as its own stack (`--stack-name compute-dev`). It needs several IDs from your network stack: VPC, private subnets, task SG, target group ARN, and both roles. For now, take those in as **Parameters** and pass them with `--parameter-overrides`. Copy the values from `aws cloudformation describe-stack-resources --stack-name net-dev --profile sandbox`. Week 6 Day 3 replaces these parameters with cross-stack imports. There's no database this week: leave `DATABASE_URL` and `REDIS_ADDR` unset, and `snip` uses its in-memory fallback (Section 0.5).
+
 **Day 1 — ECR: push your first image**
 
 1. Create the repo: `aws ecr create-repository --repository-name snip-api --image-tag-mutability IMMUTABLE --profile sandbox`.
@@ -522,63 +613,70 @@ One at a time; fix before the next.
    *Check:* `Login Succeeded`.
 3. Tag your week-4 image with the **git commit SHA**: `docker tag api:v2 <uri>:$(git rev-parse --short HEAD)` and push.
    *Check:* the image appears in ECR with that tag.
-4. Try to push the same tag again with different content.
-   *Check:* it's **rejected** because the repo is immutable. That rejection is the feature.
+4. Try to push the same tag again with different content: change one line of source **without committing** (so `git rev-parse --short HEAD` is unchanged), rebuild, re-tag with the same SHA, and push.
+   *Check:* it's **rejected** with `ImageTagAlreadyExistsException`, because the repo is immutable. That rejection is the feature. Revert the change.
 5. Write in `runbook.md` why `:latest` is dangerous.
    *Check:* your answer mentions that you can't tell what's running, and that a rollback has no target to roll back *to*.
 
 **Day 2 — Task definition in CloudFormation**
 
-1. Add an `AWS::ECS::TaskDefinition` with `RequiresCompatibilities: [FARGATE]`, `NetworkMode: awsvpc`, and Cpu/Memory `256`/`512`.
+1. In `03-compute.yaml`, add an `AWS::ECS::TaskDefinition` with `RequiresCompatibilities: [FARGATE]`, `NetworkMode: awsvpc`, and Cpu/Memory `256`/`512`.
    *Check:* `cfn-lint` passes. (Fargate only accepts specific cpu/memory pairs — an invalid combo fails at deploy, not at lint.)
 2. Set **both** roles: `ExecutionRoleArn` (week 3's execution role) and `TaskRoleArn` (week 3's task role).
    *Check:* two different ARNs. If they're the same, you've collapsed the distinction you spent week 3 learning.
-3. Add the container definition: your ECR image at the SHA tag, `PortMappings` on your app port.
-   *Check:* the image URI includes the SHA, not `latest`.
+3. Add the container definition: your ECR image at the SHA tag, `PortMappings` with `ContainerPort: 8080`. Make the tag a template Parameter (`ImageTag`), not a literal. Every deploy from here on passes `--parameter-overrides ImageTag=<sha>`.
+   *Check:* the image URI is built with `!Sub` from the repo URI and `${ImageTag}`, and never says `latest`.
 4. Add `LogConfiguration` with the `awslogs` driver, pointing at a log group you also declare in the template.
    *Check:* the log group resource exists in the same stack with `RetentionInDays` set (unretained logs bill forever).
-5. Add env vars via `Environment` and the secret via `Secrets`.
+5. Add `PORT=8080` via `Environment`, and practice the `Secrets` block by injecting a `TOKEN` from a secret, as in week 3. Week 3's teardown deleted `/dev/api/demo`, so recreate it with the same `create-secret` command. `snip` doesn't use `TOKEN`. It's there so you can see injection work on a real service. A recreated secret gets a **new** 6-character suffix, so update the ARN in the execution role's policy too.
    *Check:* no plaintext secret in the template.
 6. Deploy the stack.
    *Check:* `CREATE_COMPLETE`, and `aws ecs describe-task-definition --profile sandbox` shows revision 1.
 
 **Day 3 — ECS service + rolling deployment**
 
-1. Add an `AWS::ECS::Cluster` and an `AWS::ECS::Service` with `LaunchType: FARGATE`, `DesiredCount: 1`, your **private** subnets, `AssignPublicIp: DISABLED`, and the task SG from week 2.
+1. First retire the borrowed nginx: delete its ECS service, task definition, and cluster from `01-network-edge.yaml`. Then point the network stack at `snip`: change the target group to `Port: 8080` and `HealthCheckPath: /healthz` (`snip` returns 404 on `/`), and change the task SG's inbound rule from 80 to 8080. Redeploy `net-dev`.
+   *Check:* the target group has no registered targets and its health check path reads `/healthz`.
+2. In `03-compute.yaml`, add an `AWS::ECS::Cluster` and an `AWS::ECS::Service` with `LaunchType: FARGATE`, `DesiredCount: 1`, your **private** subnets, `AssignPublicIp: DISABLED`, and the task SG from week 2.
    *Check:* the stack deploys and the service appears in the console. **Confirm your five VPC endpoints from Week 2 Day 4 are deployed first** — without them this task cannot pull its image and you'll get `CannotPullContainerError`. If you tore them down last night, redeploy `01` with `CreateVpcEndpoints=true`.
-2. Attach `LoadBalancers` (target group ARN, container name, container port) and set `HealthCheckGracePeriodSeconds` to something realistic (60).
-   *Check:* the target registers and turns `healthy`, and `curl https://<alb-dns>/healthz` returns 200 through the ALB.
-3. Change one line of app source, rebuild, push under a **new** SHA tag, update the template's image, and deploy.
+3. Attach `LoadBalancers` (target group ARN, container name, container port `8080`) and set `HealthCheckGracePeriodSeconds` to something realistic (60).
+   *Check:* the target registers and turns `healthy`, and `curl http://<alb-dns>/healthz` returns 200 through the ALB. (Plain `http` — HTTPS arrives in week 12.)
+4. Change one line of app source, commit, rebuild, push under the **new** SHA tag, and deploy with `ImageTag=<new-sha>`.
    *Check:* watch the service Events tab — you see the new task start, become healthy, then the old one drain. Zero failed requests if you curl in a loop during it.
-4. Add `DeploymentConfiguration` with `DeploymentCircuitBreaker: { Enable: true, Rollback: true }`.
+5. Add `DeploymentConfiguration` with `DeploymentCircuitBreaker: { Enable: true, Rollback: true }`.
    *Check:* the setting shows on the service.
-5. Deliberately deploy an image tag that doesn't exist.
+6. Deliberately deploy an image tag that doesn't exist (`ImageTag=doesnotexist`).
    *Check:* the deployment fails and **automatically rolls back** to the previous task definition, with the service still serving traffic. That auto-rollback is the single most valuable ECS setting you'll turn on this week.
 
 **Day 4 — Break it on purpose**
 
-1. Ship an image that crashes on boot (e.g. exit 1 immediately). Deploy.
+1. Ship an image that crashes on boot: add `os.Exit(1)` as the first line of `main`, commit, build, push, and deploy that SHA.
    *Check:* run `aws ecs describe-tasks --profile sandbox` on the stopped task and find `stoppedReason` and the container's `exitCode`. Write both down verbatim.
 2. Ship an image that starts but fails its health check (make `/healthz` return 500).
    *Check:* the task stays **RUNNING** while the target group reports it `unhealthy` — a different failure from #1, and the distinction ECS newcomers miss.
 3. During a deploy, watch the target group.
    *Check:* you can point at a target in state `draining` and say how long it stays there (`deregistration_delay`, default 300s) and why a too-long delay makes deploys feel stuck.
-4. Enable `EnableExecuteCommand: true` on the service (and confirm the **task role** allows `ssmmessages:*`), redeploy, then shell into a *working* task: `aws ecs execute-command --interactive --command /bin/sh ...`.
-   *Check:* you get a shell inside the container and can `printenv` your secret. If it fails with a target-not-connected error, it's the task role's SSM permissions.
+4. Set up ECS Exec. You can't shell into `snip` itself: distroless has no `/bin/sh`, which is a security feature. So build a **toolbox** image instead. It's a two-line Dockerfile (`FROM alpine:3.20` + `RUN apk add --no-cache bash postgresql16-client redis curl`), pushed to a new ECR repo `toolbox`. You'll reuse it in week 8 for `psql` and `redis-cli`. Then:
+   - add a `toolbox` task definition (command `["sleep", "infinity"]`, same roles and `Secrets` block as `snip`)
+   - add the four actions `ssmmessages:CreateControlChannel`, `CreateDataChannel`, `OpenControlChannel`, `OpenDataChannel` (Resource `"*"`) to the **task role**
+   - add a sixth VPC endpoint, `ssmmessages` (Interface, same settings as the others), to `01`. ECS Exec talks to SSM, and a private task can't reach it otherwise.
+   - start it: `aws ecs run-task --cluster <cluster> --task-definition toolbox --launch-type FARGATE --enable-execute-command --network-configuration '...private subnet, task SG, assignPublicIp=DISABLED...' --profile sandbox`
+   - connect: `aws ecs execute-command --cluster <cluster> --task <task-id> --container toolbox --interactive --command /bin/bash --profile sandbox`
+   *Check:* you get a shell inside the container and can `printenv TOKEN`. If it fails with `TargetNotConnectedException`, check the task role's `ssmmessages` permissions, then the `ssmmessages` endpoint. Stop the toolbox task when done.
 5. Write the three-way discriminator in `runbook.md`: task **stopped** vs. task **unhealthy** vs. target **draining**.
    *Check:* each has a different place you look first (stopped-task reason / target group health / target group state).
 
 **Day 5 — The scheduled job**
 
-1. Register a second task definition for the Python job (its own log group, its own task role).
+1. Create an ECR repo `snip-job`, then build the week-4 job image (`--platform linux/amd64`) and push it at the git SHA. Add a second task definition for it in `03-compute.yaml`, with its own log group and its own task role (which needs **no** policies yet).
    *Check:* the job's task role has no ALB or ECR-beyond-execution permissions it doesn't need.
-2. Run it once by hand: `aws ecs run-task --launch-type FARGATE ... --profile sandbox`.
-   *Check:* the task runs to completion with `exitCode: 0` and its logs are in CloudWatch.
-3. Create an EventBridge **Scheduler** schedule (`AWS::Scheduler::Schedule`) with a cron expression and an ECS `RunTask` target, plus the IAM role the scheduler needs to call ECS.
+2. Run it once by hand: `aws ecs run-task --cluster <cluster> --task-definition <job-taskdef> --launch-type FARGATE --network-configuration '...private subnets, task SG, assignPublicIp=DISABLED...' --profile sandbox`.
+   *Check:* the task runs, its logs are in CloudWatch, and it **exits non-zero with your "could not connect" message**. There is no database until week 8, so this is the *correct* result: it proves the job fails loudly. It starts exiting `0` in week 8.
+3. Create an EventBridge **Scheduler** schedule (`AWS::Scheduler::Schedule`) with a cron expression and an ECS `RunTask` target. Also create the IAM role the scheduler uses: it trusts `scheduler.amazonaws.com`, and is allowed `ecs:RunTask` on the job task definition plus `iam:PassRole` on the job's execution and task roles.
    *Check:* the schedule shows `ENABLED` with a next-invocation time.
 4. Set the cron to a couple of minutes out and wait.
    *Check:* a task actually launches on schedule and logs. **If nothing runs, check the scheduler's IAM role first** — silent no-ops here are almost always permissions.
-5. Run `./teardown.sh`, then check Cost Explorer.
+5. Update `teardown.sh` for the new stack: `--nightly` now also **deletes** `compute-dev`, and the full teardown deletes `compute-dev` *before* `net-dev`. Run the full teardown, then check Cost Explorer.
    *Check:* zero stacks remain, and you can name this week's largest cost line.
 
 **Done when:** you can deploy a new service from image → running behind the ALB with no reference material.
@@ -601,7 +699,7 @@ This is the heart of the plan. This stack lives in CloudFormation YAML.
 
 1. In `runbook.md`, list the top-level template sections in order and what each is for: `Parameters`, `Mappings`, `Conditions`, `Resources`, `Outputs`.
    *Check:* you can name the only one that's mandatory (`Resources`).
-2. Add a `Parameters` block to your VPC template: `EnvName` (with `AllowedValues: [dev, stage, prod]`) and `VpcCidr` (with a default).
+2. In `01-network-edge.yaml`'s existing `Parameters` block, add `EnvName` (with `AllowedValues: [dev, stage, prod]` and **no** default) and `VpcCidr` (default `10.0.0.0/16`). Make the subnet CIDRs derive from it, or make them parameters too.
    *Check:* `cfn-lint` passes and the deploy command now requires `--parameter-overrides EnvName=dev`.
 3. Replace every hardcoded name in the template with `!Sub '${EnvName}-...'`.
    *Check:* no literal `dev` remains anywhere in the file. Grep for it.
@@ -614,12 +712,12 @@ This is the heart of the plan. This stack lives in CloudFormation YAML.
 
 1. Replace one hardcoded ARN with `!Sub` using pseudo-parameters (`${AWS::AccountId}`, `${AWS::Region}`, `${AWS::StackName}`).
    *Check:* the deployed resource's ARN is identical to before — the refactor changed nothing observable.
-2. Add a `Mappings` block keyed by environment (e.g. instance sizes or CIDRs) and read it with `!FindInMap`.
-   *Check:* deploying with `EnvName=stage` picks up the stage values.
-3. Add a `Conditions` block (`IsProd: !Equals [!Ref EnvName, prod]`) and attach `Condition: IsProd` to one resource.
+2. In `03-compute.yaml`, add a `Mappings` block named `EnvConfig`, keyed by environment, with a `DesiredCount` for each (dev `1`, stage `1`, prod `2`). Set the service's `DesiredCount: !FindInMap [EnvConfig, !Ref EnvName, DesiredCount]`.
+   *Check:* deploy with `EnvName=prod` and the service shows desired count 2. Deploy `dev` again and it drops to 1.
+3. Add a `Conditions` block (`IsProd: !Equals [!Ref EnvName, prod]`) and attach `Condition: IsProd` to one cheap resource, e.g. an extra CloudWatch log group named `!Sub '${EnvName}-audit'`.
    *Check:* deploy with `EnvName=dev` — the resource is **absent**. Deploy with `prod` — it appears. Verify both.
-4. Now use the same mechanism for cost control: add a `CreateVpcEndpoints` parameter and gate all five VPC endpoints (and, if you built one, the NAT Gateway) behind a `Condition`.
-   *Check:* `--parameter-overrides CreateVpcEndpoints=false` removes them in one deploy. This is the toggle the nightly teardown rule in Section 3 depends on — it turns "delete the expensive bits" into a one-line parameter change instead of a stack surgery.
+4. Revisit the `CreateVpcEndpoints` / `CreateLoadBalancer` toggles you copied in on Week 2 Day 4. Now that you know what `Parameters` and `Conditions` do, read them line by line and confirm they gate all six endpoints (five from week 2, plus `ssmmessages` from week 5), the ALB pieces, and the NAT Gateway if you built one.
+   *Check:* `--parameter-overrides CreateVpcEndpoints=false` removes every endpoint in one deploy. This is the toggle the nightly teardown rule in Section 3 depends on — it turns "delete the expensive bits" into a one-line parameter change instead of a stack surgery.
 5. Write down the difference between `!Ref` and `!GetAtt` for the same resource.
    *Check:* you can say what `!Ref` returns for a VPC vs. what `!GetAtt` gives you, and why the docs page for each resource type has a "Return values" section you'll live in.
 6. Run `cfn-lint` on everything.
@@ -629,8 +727,8 @@ This is the heart of the plan. This stack lives in CloudFormation YAML.
 
 1. In your network stack, add `Export: { Name: !Sub '${EnvName}-VpcId' }` to the VPC output, and the same for the subnet outputs.
    *Check:* `aws cloudformation list-exports --profile sandbox` lists them.
-2. In your compute stack, replace the hardcoded subnet IDs with `!ImportValue !Sub '${EnvName}-PrivateSubnetA'` (etc.). Deploy.
-   *Check:* the compute stack deploys and the service still runs.
+2. Export everything else `03-compute.yaml` currently takes as a Parameter from week 5 (task SG, target group ARN, role ARNs) the same way. Then in `03-compute.yaml`, delete those Parameters and replace each use with an import, e.g. `!ImportValue !Sub '${EnvName}-PrivateSubnetA'`. Deploy.
+   *Check:* the compute stack deploys with no `--parameter-overrides` except `EnvName` and `ImageTag`, and the service still runs.
 3. Now try to delete the **network** stack while compute is still up.
    *Check:* it **fails** with "Export ... cannot be deleted as it is in use by <stack>". Read that message carefully — it's the enforcement mechanism behind stack layering.
 4. Try to *change* the exported value's name in the network stack.
@@ -640,10 +738,10 @@ This is the heart of the plan. This stack lives in CloudFormation YAML.
 
 **Day 4 — Split into four layered stacks**
 
-1. Create the four files: `00-bootstrap.yaml` (S3 template bucket, ECR repo, shared IAM), `01-network-edge.yaml`, `02-data.yaml` (placeholder for now), `03-compute.yaml`.
+1. Create the four files: `00-bootstrap.yaml` (S3 template bucket, ECR repos, shared IAM roles), `01-network-edge.yaml`, `02-data.yaml`, `03-compute.yaml`. `02-data` gets its real contents in week 8. CloudFormation rejects a template with no resources, so for now give it one no-op resource: `Placeholder: { Type: AWS::CloudFormation::WaitConditionHandle }`. Name the stacks after the files from now on (`dev-00-bootstrap`, `dev-01-network-edge`, …, i.e. `${EnvName}-<file>`), replacing `net-dev`/`compute-dev`.
    *Check:* four files, each lints clean, each takes `EnvName`.
-2. **Deal with the ECR repo you created by hand in week 5.** You made it with `aws ecr create-repository`; `00-bootstrap.yaml` now declares the same repo. Deploying as-is fails with `Resource of type 'AWS::ECR::Repository' with identifier 'snip-api' already exists` — CloudFormation will not adopt a resource it didn't create. Pick one: (a) delete the repo and let CFN recreate it (you'll re-push your image), or (b) **import** it with `aws cloudformation create-change-set --change-set-type IMPORT --resources-to-import ...`.
-   *Check:* `00-bootstrap` deploys clean and `describe-stack-resources` lists the ECR repo as stack-managed. Do (b) at least once — resource import is how you bring real, hand-made production resources under IaC, and it's a genuinely useful thing to have done.
+2. **Deal with the ECR repos you created by hand** (`snip-api`, `snip-job`, `toolbox`, and week 2's `nginx`, which you can simply delete). `00-bootstrap.yaml` now declares the same repos. Deploying as-is fails with `Resource of type 'AWS::ECR::Repository' with identifier 'snip-api' already exists` — CloudFormation will not adopt a resource it didn't create. Pick one per repo: (a) delete the repo and let CFN recreate it (you'll re-push your image), or (b) **import** it. To import, give the resource `DeletionPolicy: Retain` in the template (import requires one), then run `aws cloudformation create-change-set --stack-name dev-00-bootstrap --change-set-name import1 --change-set-type IMPORT --template-body file://00-bootstrap.yaml --parameters ParameterKey=EnvName,ParameterValue=dev --resources-to-import '[{"ResourceType":"AWS::ECR::Repository","LogicalResourceId":"<LogicalId>","ResourceIdentifier":{"RepositoryName":"snip-api"}}]' --profile sandbox`, then `execute-change-set`. The template you import with must contain **only** the resources being imported (plus any already in the stack). Add the rest in a normal deploy afterwards.
+   *Check:* `00-bootstrap` deploys clean and `describe-stack-resources` lists the ECR repos as stack-managed. Do (b) at least once — resource import is how you bring real, hand-made production resources under IaC, and it's a genuinely useful thing to have done.
 3. Move each remaining resource into the file where it belongs.
    *Check:* nothing is duplicated across two files, and nothing was dropped — count your resources before and after.
 4. Add a header comment to each file: what it owns, what it exports, what it imports.
@@ -657,8 +755,8 @@ This is the heart of the plan. This stack lives in CloudFormation YAML.
 
 1. Deploy all four in order with `EnvName=dev`, waiting for each to complete before the next.
    *Check:* four `CREATE_COMPLETE`s and a working app.
-2. Write `deploy.sh` that encodes that order and waits.
-   *Check:* the script fails fast if any stack fails, rather than plowing on.
+2. Write `deploy.sh` that encodes that order and waits. It takes two arguments, `./deploy.sh <env> <image-tag>`, and passes them as `EnvName` and `ImageTag`. Don't hardcode `--profile sandbox`: let the AWS CLI read the `AWS_PROFILE` environment variable (`export AWS_PROFILE=sandbox` in your shell). In week 10, CI runs this same script with no profile at all. (`aws cloudformation deploy` already waits for completion, so no separate `wait` command is needed.)
+   *Check:* `set -euo pipefail` is at the top, and the script stops at the first failed stack rather than plowing on.
 3. Deploy the **same templates** with `EnvName=stage`.
    *Check:* a second, fully independent environment comes up with **zero template edits**. If you had to edit anything, that thing should have been a Parameter — fix it now.
 4. Confirm the two environments are actually isolated.
@@ -680,40 +778,40 @@ This is the heart of the plan. This stack lives in CloudFormation YAML.
 
 1. Redeploy your `dev` environment so you have something to operate on.
    *Check:* all four stacks `CREATE_COMPLETE`.
-2. Make a harmless template edit (add a tag), then create a change set instead of deploying: `aws cloudformation create-change-set --change-set-name t1 ... --profile sandbox`.
-   *Check:* `describe-change-set` lists one change with `Action: Modify`.
+2. Make a harmless template edit (add a `Tags` entry to the VPC in `01`), then create a change set instead of deploying. The easiest way is to reuse `deploy` with one extra flag: `aws cloudformation deploy --template-file 01-network-edge.yaml --stack-name dev-01-network-edge --parameter-overrides EnvName=dev --no-execute-changeset --profile sandbox`. It prints the change set's name.
+   *Check:* `aws cloudformation describe-change-set --stack-name dev-01-network-edge --change-set-name <name> --profile sandbox` lists one change with `Action: Modify`.
 3. Read the change's `ResourceChange` fields: `Action`, `Replacement`, and `Scope`.
-   *Check:* `Replacement: False`. Execute the change set and confirm nothing was recreated.
-4. Now make a **replacing** change (rename a resource's physical name, e.g. a security group's `GroupName`) and create another change set — **do not execute it**.
+   *Check:* `Replacement: False`. Execute it (`aws cloudformation execute-change-set --stack-name ... --change-set-name <name> --profile sandbox`) and confirm nothing was recreated.
+4. Now make a **replacing** change: set or change the `GroupName` property on a security group (the SG's physical name), and create another change set the same way — **do not execute it**.
    *Check:* `Replacement: True`. This is the field that silently deletes and recreates a database. Memorize where to find it.
 5. Delete that change set unexecuted.
    *Check:* the stack is untouched. Write in `runbook.md`: "before any prod update, read the change set and grep for `Replacement`."
 
 **Day 2 — Failed update and automatic rollback**
 
-1. Introduce a deliberately invalid property value (e.g. an out-of-range port or a bad instance type). Deploy.
+1. Introduce a deliberately invalid property value that `cfn-lint` might not catch but AWS will reject. For example, set the target group's `HealthCheckIntervalSeconds: 1` (valid range is 5–300). Deploy, skipping lint.
    *Check:* the stack enters `UPDATE_ROLLBACK_IN_PROGRESS`, then `UPDATE_ROLLBACK_COMPLETE`, and the app still works on the old config.
 2. Open the Events tab and scroll to the **bottom** of the failure block, then read upward.
    *Check:* you found the **first** `CREATE_FAILED`/`UPDATE_FAILED` event. Everything above it is consequence, not cause — same as reading a stack trace.
 3. Copy that first failure's `ResourceStatusReason` verbatim into `runbook.md`.
    *Check:* it names a specific property, not a generic "resource failed".
-4. Cause a second, different failure: a name collision (hardcode a resource name that already exists).
+4. Cause a second, different failure: a name collision. Create a log group by hand (`aws logs create-log-group --log-group-name collision-test --profile sandbox`), then add an `AWS::Logs::LogGroup` with `LogGroupName: collision-test` to a template and deploy.
    *Check:* the reason string is clearly different from #1, and you can tell them apart at a glance.
-5. Fix both and deploy clean.
+5. Fix both (restore the interval, remove the colliding resource, delete the hand-made log group) and deploy clean.
    *Check:* `UPDATE_COMPLETE`.
 
 **Day 3 — `UPDATE_ROLLBACK_FAILED` (the scary one)**
 
-1. Pick a non-critical resource in a stack and **delete it out-of-band** in the console (that's the thing you'd normally never do — today you do it on purpose).
-   *Check:* the resource is gone from AWS but still present in the template.
-2. Trigger a stack update that fails.
-   *Check:* rollback starts, then fails because it can't restore a resource that no longer exists → status `UPDATE_ROLLBACK_FAILED`.
+1. Add a throwaway `AWS::Logs::LogGroup` (logical ID `Doomed`, `RetentionInDays: 3`) to `03-compute.yaml` and deploy. Then **delete it out-of-band**: `aws logs delete-log-group --log-group-name <its-name> --profile sandbox`. (That's the thing you'd normally never do — today you do it on purpose.)
+   *Check:* the log group is gone from AWS but still present in the template and the stack's Resources tab.
+2. Trigger an update that touches it: change `Doomed`'s `RetentionInDays` to `7` and deploy.
+   *Check:* the update fails because the log group doesn't exist. Then the rollback tries to set retention back to 3 on that same missing log group, fails too, and the stack lands in `UPDATE_ROLLBACK_FAILED`. (If it reaches `UPDATE_ROLLBACK_COMPLETE` instead, CloudFormation coped on its own. Repeat with a resource it can't recreate, such as an SNS subscription or an SSM parameter, and note in the runbook which types self-heal.)
 3. Confirm the stack is now stuck.
    *Check:* a normal `deploy` is **rejected** outright. This is the state that causes real on-call panic — you're meeting it in safety.
-4. Recover: `aws cloudformation continue-update-rollback --stack-name <name> --resources-to-skip <LogicalId> --profile sandbox`.
+4. Recover: `aws cloudformation continue-update-rollback --stack-name <name> --resources-to-skip Doomed --profile sandbox`.
    *Check:* status becomes `UPDATE_ROLLBACK_COMPLETE`.
-5. Reconcile: the skipped resource is now missing from reality but present in the template. Redeploy to recreate it.
-   *Check:* `UPDATE_COMPLETE` and the resource exists again.
+5. Reconcile: the skipped resource is now missing from reality but CloudFormation still thinks it exists, so a plain redeploy will hit the same error. The clean fix is two deploys: first remove `Doomed` from the template and deploy (CloudFormation "deletes" it, and a resource that's already gone counts as deleted). Then add it back and deploy again.
+   *Check:* `UPDATE_COMPLETE` and the log group exists again.
 6. Write the whole recovery as a numbered runbook procedure, including the exact command.
    *Check:* a stranger could follow it under pressure without thinking.
 
@@ -732,8 +830,8 @@ This is the heart of the plan. This stack lives in CloudFormation YAML.
 
 **Day 5 — `DeletionPolicy` and stateful resources**
 
-1. Add `DeletionPolicy: Retain` to a stateful resource (an S3 bucket is a cheap stand-in for RDS this week).
-   *Check:* the property is on the resource and the stack updates clean.
+1. In a new throwaway template `retain-test.yaml` (stack `retain-test`, so you don't risk your real stacks), declare one S3 bucket with a fixed `BucketName` (e.g. `retain-test-<your-account-id>`) and `DeletionPolicy: Retain`. The bucket is a cheap stand-in for RDS this week. `DeletionPolicy` is a resource *attribute*, written at the same level as `Type:`, not inside `Properties:`. Deploy.
+   *Check:* the stack reaches `CREATE_COMPLETE`.
 2. Delete the stack.
    *Check:* stack `DELETE_COMPLETE`, but the bucket **still exists**. That's the point.
 3. Note the consequence: the retained resource is now unmanaged, and recreating the stack will collide on its name.
@@ -765,9 +863,13 @@ This is the heart of the plan. This stack lives in CloudFormation YAML.
    *Check:* private subnets only. A DB subnet group containing public subnets is how databases end up internet-reachable.
 2. Add a database security group whose only inbound rule is `5432` **from the task security group** (SG reference, not CIDR).
    *Check:* one inbound rule, source `sg-...`.
-3. Declare credentials as `AWS::SecretsManager::Secret` with a `GenerateSecretString` block and `RecoveryWindowInDays: 0` — never a template Parameter.
-   *Check:* no password appears in the template, in `deploy.sh`, or in your shell history. The zero recovery window is what lets you rebuild this stack tomorrow under the same secret name (week 3 Day 3's trap).
-4. Add the `AWS::RDS::DBInstance`: `db.t4g.micro`, `20` GB, `StorageEncrypted: true`, `PubliclyAccessible: false`, `MultiAZ: false`, credentials via dynamic reference to the secret.
+3. Replace the `02-data.yaml` placeholder with real resources. Declare credentials as an `AWS::SecretsManager::Secret` with a `GenerateSecretString` block (`SecretStringTemplate: '{"username":"snip"}'`, `GenerateStringKey: password`, `ExcludeCharacters: '"@/\'`, characters RDS rejects in passwords). Never pass credentials as a template Parameter.
+   *Check:* no password appears in the template, in `deploy.sh`, or in your shell history. After your first teardown of this stack, run `aws secretsmanager list-secrets --include-planned-deletion --profile sandbox`. If the secret is listed as scheduled for deletion, `teardown.sh` must force-delete it, or tomorrow's rebuild hits week 3 Day 3's name-reserved trap.
+4. Add the `AWS::RDS::DBInstance`: `Engine: postgres`, `db.t4g.micro`, `20` GB, `DBName: snip`, `StorageEncrypted: true`, `PubliclyAccessible: false`, `MultiAZ: false`. Pass the credentials via **dynamic references** to the secret. These are strings CloudFormation resolves at deploy time, so the password never appears in the template:
+   ```yaml
+   MasterUsername: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:username}}'
+   MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:password}}'
+   ```
    *Check:* `cfn-lint` clean, and `PubliclyAccessible` is explicitly `false`.
 5. Add an `AWS::SecretsManager::SecretTargetAttachment` linking the secret to the instance.
    *Check:* you understand it's what fills in host/port in the secret — without it your app gets credentials with no address.
@@ -782,54 +884,56 @@ This is the heart of the plan. This stack lives in CloudFormation YAML.
    *Check:* it **hangs, then times out**. Understand exactly why: private subnets, no public route, SG allows only the task SG. This is correct behavior.
 3. Retrieve the secret and confirm it now contains host, port, username, password.
    *Check:* `aws secretsmanager get-secret-value --secret-id ... --profile sandbox | jq -r .SecretString` shows all four fields.
-4. Wire the API to build its connection string from the injected secret, redeploy the service.
-   *Check:* the task starts and `/healthz` reports database connectivity.
-5. Shell into the running task with ECS Exec and connect to the database from there.
-   *Check:* you get a `psql` prompt from inside the VPC. Same database, different network position — that contrast is the whole lesson.
+4. Wire the API to the database the way Section 0.5 requires: pass the secret's ARN as a **plain** env var `DB_SECRET_ARN` (via `Environment`, not `Secrets`). Each time the API opens a new connection, it calls `GetSecretValue` with the AWS SDK for Go and builds the connection string from host/port/username/password. Because your **code** now makes the call, grant `secretsmanager:GetSecretValue` on that ARN to the **task** role (the week 3 Day 2 prediction, now real). Remove `DATABASE_URL`. Export the secret ARN from `02` and import it in `03`. Redeploy.
+   *Check:* the task starts, its log shows a successful DB connection and the `schema.sql` run, and `POST /links` returns 201. `/healthz` stays DB-independent (Section 0.5), so don't use it for this check.
+5. Start your week-5 **toolbox** task and ECS Exec into it (snip's distroless image has no shell). Connect with `psql -h <rds-endpoint> -U snip -d snip`, using the password from step 3.
+   *Check:* you get a `psql` prompt from inside the VPC. Same database, different network position — that contrast is the whole lesson. (If it times out, the DB SG only trusts the task SG, so make sure toolbox runs with the task SG.)
 6. Persist a link through the API and read it back after a task restart.
    *Check:* the row survives — you're no longer in-memory.
+7. Give the Python job the same treatment. Pass it `DB_SECRET_ARN`, have it fetch the secret with `boto3`, and grant `GetSecretValue` to the job's task role. Then run it with `run-task`.
+   *Check:* the job now **exits `0`** — the week-5 "could not connect" failure is gone.
 
 **Day 3 — Connection limits**
 
-1. From inside a task, run `SHOW max_connections;`.
+1. From `psql` in the toolbox task, run `SHOW max_connections;`.
    *Check:* you have the number (on `db.t4g.micro` it's small — low hundreds).
 2. Find how many your app opens: check your pool settings, and query `SELECT count(*) FROM pg_stat_activity;`.
    *Check:* you can state connections-per-task × desired-count and compare it to the limit.
-3. Deliberately exhaust it: scale the service up, or open a loop of connections from a shell.
+3. Deliberately exhaust it from the toolbox shell. Open more idle connections than `max_connections` allows: `for i in $(seq 1 120); do psql -h <endpoint> -U snip -d snip -c 'select pg_sleep(600)' & done`, with `PGPASSWORD` exported first. Then send traffic to the API.
    *Check:* you see `FATAL: remaining connection slots are reserved for non-replication superuser connections`. Copy it verbatim.
 4. Note what the failure looks like from the *outside*.
    *Check:* the ALB returns 5xx while every task is `healthy` and the database is `available` — nothing is "down", yet the app is broken. That's why this incident is confusing in real life.
-5. Fix it by bounding the pool, then confirm recovery.
-   *Check:* errors stop without restarting the database.
+5. Kill the loop (`kill $(jobs -p)`), then make the fix permanent: bound the API's pool (`db.SetMaxOpenConns(10)` in Go's `database/sql`, or `MaxConns` in pgx) so tasks × pool size stays well under the limit. Redeploy.
+   *Check:* errors stop without restarting the database, and step 2's arithmetic now fits under `max_connections` even at the prod desired count.
 6. Write the runbook entry: symptom → `pg_stat_activity` → pool math → fix.
    *Check:* it includes the arithmetic, not just "use a pool".
 
 **Day 4 — Secrets rotation**
 
-1. Turn on rotation for the DB secret (Secrets Manager → Rotation → the RDS rotation Lambda), interval 30 days.
+1. Turn on rotation for the DB secret in the console (Secrets Manager → your secret → Rotation → Edit rotation → turn on automatic rotation, 30 days → "Create a rotation function", single-user strategy). The rotation Lambda must reach both RDS and Secrets Manager. When asked for its network settings, put it in your **private subnets** with the **task SG**, which the DB SG and the endpoint SG already trust. (Rotation set up in the console is drift from your template. Note it in `runbook.md` as something to move into CloudFormation later with `AWS::SecretsManager::RotationSchedule`.)
    *Check:* rotation shows as enabled and the rotation function was created.
 2. Trigger a rotation immediately: `aws secretsmanager rotate-secret --secret-id ... --profile sandbox`.
    *Check:* the secret's `VersionStages` show a new `AWSCURRENT` and the previous version as `AWSPREVIOUS`.
 3. Watch your **already-running** task while this happens.
-   *Check:* existing connections keep working (they authenticated already), but a task that restarts now picks up the new password. Confirm both halves.
-4. Force the failure: make the app cache credentials at boot and never re-read them, then rotate twice (so `AWSPREVIOUS` is invalidated too).
+   *Check:* existing pooled connections keep working (they authenticated already), and new connections succeed because the app fetches the secret per connection. Confirm both: hit the API, then force new connections by restarting the task (`update-service --force-new-deployment`).
+4. Force the failure: change the app to fetch the secret **once at boot** and reuse it forever, deploy that, then rotate twice (so `AWSPREVIOUS` is invalidated too) and force new connections by setting a short `SetConnMaxLifetime`.
    *Check:* new connections fail with an auth error while the task is otherwise healthy.
-5. Write the two mitigations in `runbook.md`: re-read the secret on connection failure, or have the pipeline force a service restart after rotation.
+5. Revert to per-connection fetching and redeploy. Write the two mitigations in `runbook.md`: re-read the secret on connection failure, or have the pipeline force a service restart after rotation.
    *Check:* you can say which one a deploy pipeline can do and which one only the app can do.
 
 **Day 5 — Redis, snapshots, teardown**
 
-1. Add ElastiCache (`AWS::ElastiCache::SubnetGroup` + `CacheCluster`, `cache.t4g.micro`, single node) with an SG allowing `6379` from the task SG only. Deploy.
+1. Add ElastiCache to `02-data.yaml` (`AWS::ElastiCache::SubnetGroup` with your private subnets, plus an `AWS::ElastiCache::CacheCluster` with `Engine: redis`, `cache.t4g.micro`, `NumCacheNodes: 1`) with an SG allowing `6379` from the task SG only. Output and export the endpoint (`!GetAtt <Cluster>.RedisEndpoint.Address`). Deploy.
    *Check:* status `available` and the endpoint appears in stack outputs.
-2. Connect from a task with `redis-cli -h <endpoint>`.
-   *Check:* `PING` → `PONG` from inside the VPC, and refused from your laptop.
-3. Implement cache-aside on `GET /:code`: check Redis → miss → read Postgres → write to Redis with a TTL.
+2. Connect from the toolbox task with `redis-cli -h <endpoint>`.
+   *Check:* `PING` → `PONG` from inside the VPC. From your laptop the same command hangs and times out (private subnet, no route), which is the same lesson as RDS.
+3. Set `REDIS_ADDR=<endpoint>:6379` on the API (import the endpoint in `03`) and implement cache-aside on `GET /:code`: check Redis → on a miss, read Postgres → write to Redis with a TTL (e.g. 1 hour). Log `cache=hit` or `cache=miss` on each request.
    *Check:* first request logs a miss, second logs a hit, and you can see the key with `redis-cli KEYS '*'`.
-4. Take a manual RDS snapshot and restore it into a new instance.
-   *Check:* the restored instance reaches `available` and contains your links. Then **delete the restored instance immediately** — it bills like any other.
+4. Take a manual RDS snapshot (`aws rds create-db-snapshot`) and restore it into a new instance (`aws rds restore-db-instance-from-db-snapshot`, with the same DB subnet group and DB SG). Do this from the CLI, not the template: it's an operational drill.
+   *Check:* the restored instance reaches `available` and contains your links (check with `psql` from the toolbox). Then **delete the restored instance immediately** — it bills like any other.
 5. Run `./teardown.sh`, including `02-data`.
    *Check:* all stacks gone.
-6. Check for orphans: `aws rds describe-db-snapshots --snapshot-type manual --profile sandbox` and the EC2 → Elastic IPs page.
+6. Check for orphans: `aws rds describe-db-snapshots --snapshot-type manual --profile sandbox` and the EC2 → Elastic IPs page. Delete step 4's snapshot (`aws rds delete-db-snapshot`), and delete the rotation Lambda the console created in Day 4.
    *Check:* **zero manual snapshots**. Snapshots outlive their stacks and bill silently — this is the #1 way a sandbox quietly costs money.
 
 **Done when:** "the app can't reach the database" is a 5-minute diagnosis: SG → subnet/route → credentials → connection limit → DNS.
@@ -846,7 +950,7 @@ This is the heart of the plan. This stack lives in CloudFormation YAML.
 
 **Day 1 — Structured logs**
 
-1. Redeploy `dev` end to end.
+1. Redeploy `dev` end to end with `./deploy.sh dev <sha>`.
    *Check:* app serving through the ALB, database and cache connected.
 2. Confirm the `awslogs` config on the task definition: log group, `awslogs-stream-prefix`, region.
    *Check:* in CloudWatch you can find a stream named `<prefix>/<container>/<task-id>` and map it back to a specific task.
@@ -867,8 +971,8 @@ This is the heart of the plan. This stack lives in CloudFormation YAML.
    *Check:* it's in Saved queries with a name you'll recognize at 2am.
 4. Save query 2 (p99 latency: `stats pct(duration_ms, 99) by bin(5m)`) and query 3 (5xx by path: `filter status >= 500 | stats count() by path`).
    *Check:* both return data when you generate traffic, and empty when you don't.
-5. Save query 5 (DB connection errors: `filter @message like /connection/`).
-   *Check:* it matches the connection-exhaustion errors you produced in week 8.
+5. Save query 5 (DB connection errors: `filter @message like /connection/`). Query 4 is step 6. It comes last because it needs extra setup.
+   *Check:* it matches the connection-exhaustion errors you produced in week 8. (Your logs from week 8 were deleted with the stack, so replay week 8 Day 3 step 3 for a minute to generate fresh ones.)
 6. For query 4 — **task startup failures** — first understand why you can't just query for them: stopped-task reasons live in the **ECS API and EventBridge**, not in CloudWatch Logs. A task that dies before your code runs never writes a log line. Create an EventBridge rule matching `ECS Task State Change` events with a CloudWatch Logs target, then query *that* log group for `stoppedReason`.
    *Check:* kill a task and find its `stoppedReason` via Logs Insights. Five saved queries total. This is the gap that makes startup failures feel invisible — now they're searchable alongside everything else.
 7. Time yourself answering "what was the slowest endpoint in the last hour?"
@@ -880,14 +984,14 @@ This is the heart of the plan. This stack lives in CloudFormation YAML.
    *Check:* the subscription status is `Confirmed`, not `PendingConfirmation`. Unconfirmed subscriptions are the reason "the alarm never fired".
 2. Create an alarm on ALB `HTTPCode_Target_5XX_Count` > 5 in 5 minutes → SNS.
    *Check:* the alarm exists in `OK` state.
-3. Create alarms on `UnHealthyHostCount` ≥ 1, `TargetResponseTime` p99, and ECS service CPU/memory utilization.
-   *Check:* four alarms, each with a threshold you can justify out loud.
-4. Force one alarm into `ALARM` for real (break the health endpoint for two minutes).
+3. Create four more alarms, all → SNS: `UnHealthyHostCount` ≥ 1; `TargetResponseTime` p99 > 1 s; ECS service `CPUUtilization` > 80%; ECS service `MemoryUtilization` > 80%.
+   *Check:* five alarms in total, each with a threshold you can justify out loud.
+4. Force one alarm into `ALARM` for real: deploy an image whose `/healthz` returns 500 and leave it for a few minutes. The `UnHealthyHostCount` alarm should fire. (The 5xx alarm won't, because the ALB's own health checks aren't counted as requests.) Redeploy the good SHA afterwards.
    *Check:* the state goes to `ALARM` **and the email arrives**. Both halves, or it doesn't count.
 5. Build one dashboard with: request rate, 5xx count, p99 latency, healthy host count, CPU/memory, and the DB connection count.
    *Check:* one screen answers "is it up, is it fast, is it healthy".
-6. Add the dashboard and alarms to your CloudFormation templates.
-   *Check:* they survive a teardown/redeploy cycle.
+6. Add the SNS topic, alarms, and dashboard to `03-compute.yaml` (`AWS::SNS::Topic`, `AWS::CloudWatch::Alarm`, `AWS::CloudWatch::Dashboard`). For the dashboard, open it in the console → Actions → **View/edit source**, and paste that JSON into `DashboardBody`. Delete the console-made versions.
+   *Check:* they survive a teardown/redeploy cycle. (You'll need to re-confirm the SNS email subscription after each rebuild. Note that in the runbook.)
 
 **Day 4 — Chaos day**
 
@@ -957,9 +1061,12 @@ Rules: break it, then **diagnose starting from CloudWatch and the console only**
 
 1. Add a `build` job using a Docker executor with `setup_remote_docker`, doing checkout + `docker build`.
    *Check:* green, and the build log shows your Dockerfile steps.
-2. Store temporary AWS credentials as a CircleCI **context** (you'll replace these with OIDC tomorrow — this is deliberately the throwaway version).
-   *Check:* the job can run `aws sts get-caller-identity` and it prints your account.
-3. Add ECR login + tag with `${CIRCLE_SHA1}` + push.
+2. Give CI throwaway AWS credentials (you'll replace these with OIDC tomorrow — this is deliberately the throwaway version):
+   - create an IAM user `circleci-temp` with the managed policy `AmazonEC2ContainerRegistryPowerUser`, and create an access key for it
+   - in CircleCI → Organization Settings → **Contexts**, create a context `aws-temp` with env vars `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`
+   - in the workflow, add `context: aws-temp` under the `build` job
+   *Check:* the job can run `aws sts get-caller-identity` and it prints `...:user/circleci-temp`.
+3. Add ECR login + tag with `${CIRCLE_SHA1}` + push. CircleCI's `CIRCLE_SHA1` is the *full* 40-character SHA. Either use it everywhere from now on, or shorten it with `${CIRCLE_SHA1:0:7}` to match your local tags. Pick one and be consistent.
    *Check:* the image appears in ECR under the commit SHA. That SHA is now the link between a git commit and a running container.
 4. Push a second commit.
    *Check:* two images in ECR with different SHA tags, and you can trace each back to its commit.
@@ -968,24 +1075,31 @@ Rules: break it, then **diagnose starting from CloudWatch and the console only**
 
 **Day 3 — Tests, caching, and OIDC**
 
-1. Add a `test` job that runs your unit tests, and make `build` require it.
+1. Add a `test` job that runs `go test ./...` (and `pytest` for the job, if you wrote tests), and make `build` require it. If you have no tests yet, write one: a test that `POST /links` then `GET /:code` returns 302 against the in-memory store is enough.
    *Check:* break a test on purpose — the pipeline stops before building. Fix it; it proceeds.
-2. Add dependency caching (`save_cache`/`restore_cache`) keyed on your lockfile's checksum.
+2. Add dependency caching (`save_cache`/`restore_cache`) keyed on your lockfile's checksum, e.g. `key: go-mod-{{ checksum "go.sum" }}` caching `~/go/pkg/mod`.
    *Check:* second run logs a cache hit and is measurably faster.
-3. In AWS, create an IAM **OIDC identity provider** for `oidc.circleci.com/org/<your-org-id>`.
+3. In AWS, create an IAM **OIDC identity provider** (IAM → Identity providers → Add provider → OpenID Connect) with provider URL `https://oidc.circleci.com/org/<your-org-id>` and audience `<your-org-id>`. Copy the org ID from CircleCI → Organization Settings → Overview, and the project ID from Project Settings → Overview.
    *Check:* the provider appears in IAM → Identity providers.
-4. Create a `circleci-deploy` IAM role trusting that provider, with a condition on `aud` (your org id) and `sub` (your project).
+4. Create a `circleci-deploy` IAM role whose trust policy allows `sts:AssumeRoleWithWebIdentity` from that provider, with two conditions:
+   ```json
+   "Condition": {
+     "StringEquals": { "oidc.circleci.com/org/<org-id>:aud": "<org-id>" },
+     "StringLike":   { "oidc.circleci.com/org/<org-id>:sub": "org/<org-id>/project/<project-id>/user/*" }
+   }
+   ```
+   Create this role (and the provider) **by hand, outside your stacks**, and keep it through every teardown. CI can't create the role it uses to log in.
    *Check:* the trust policy's condition is present. Without the `sub` condition, *any* project in your org could assume this role.
-5. Replace the stored access keys with the CircleCI OIDC orb/token flow assuming that role, and **delete the long-lived keys**.
-   *Check:* `aws sts get-caller-identity` in CI now returns `assumed-role/circleci-deploy/...`, and no AWS keys remain in CircleCI env vars.
+5. Replace the stored access keys with OIDC. CircleCI only issues an OIDC token (`$CIRCLE_OIDC_TOKEN_V2`) to jobs that use **at least one context**, so create an empty context `aws-oidc` and attach it in place of `aws-temp`. Then, in the job, either use the `circleci/aws-cli` orb's `setup` command with `role_arn`, or run `aws sts assume-role-with-web-identity --role-arn <circleci-deploy-arn> --role-session-name ci --web-identity-token "$CIRCLE_OIDC_TOKEN_V2"` and export the returned keys. Finally **delete** the `aws-temp` context and the `circleci-temp` IAM user.
+   *Check:* `aws sts get-caller-identity` in CI now returns `assumed-role/circleci-deploy/...`, and no AWS keys remain in CircleCI.
 6. Scope the role's permissions to only what the pipeline does (ECR push, S3 template upload, CloudFormation, `iam:PassRole` for your task roles).
    *Check:* remove one needed permission and watch the pipeline fail with a precise `AccessDenied` — then put it back.
 
 **Day 4 — Environment promotion**
 
-1. Parameterize a `deploy` job with an `env` parameter that runs your `deploy.sh` with `EnvName=<env>`.
+1. Define one `deploy` job with a job `parameters:` entry `env` (type string). It runs `./deploy.sh << parameters.env >> $CIRCLE_SHA1` (shortened if you chose that on Day 2). In the workflow, invoke it twice under different names: `name: deploy-dev` with `env: dev`, and `name: deploy-stage` with `env: stage`.
    *Check:* one job definition, two invocations.
-2. Add a step uploading your templates to the `00-bootstrap` S3 bucket before deploying.
+2. Add a step uploading your templates to the `00-bootstrap` S3 bucket before deploying, under `templates/<sha>/` (e.g. `aws s3 cp --recursive . s3://<bucket>/templates/$CIRCLE_SHA1/ --exclude '*' --include '*.yaml'`). `deploy.sh` doesn't read them yet. Week 11's state machine deploys from these S3 copies.
    *Check:* the objects appear in S3 with the commit SHA in the key.
 3. Wire `deploy-dev` into the workflow after `build`.
    *Check:* a push to `main` deploys to `dev` and the new SHA is actually running (`aws ecs describe-services` shows the new task definition).
@@ -1004,8 +1118,8 @@ Rules: break it, then **diagnose starting from CloudWatch and the console only**
    *Check:* fails in the **CI log** with `AccessDenied` naming the assumed-role ARN and the exact action.
 3. Break the cache key (change it to a constant) and note the effect.
    *Check:* stale dependencies get restored and the build behaves inconsistently between runs — the worst kind of CI bug because it's invisible in the log.
-4. Push a new image but *don't* update the task definition's image tag.
-   *Check:* the pipeline is **green** and the old code is still serving. Nothing failed — that's why this one is dangerous. Add a verification step that asserts the running task definition matches `CIRCLE_SHA1`.
+4. Temporarily hardcode the `ImageTag` passed by `deploy.sh` to the *previous* SHA, then push a new commit.
+   *Check:* the pipeline is **green** and the old code is still serving. Nothing failed — that's why this one is dangerous. Add a final verification step to `deploy` that reads the running image (`aws ecs describe-services` → task definition → `describe-task-definition` → container `image`) and fails the job if it doesn't end in the current SHA. Then remove the hardcode.
 5. Make a CloudFormation-level failure (bad property) reach the deploy job.
    *Check:* the CI log shows only "deploy failed"; the real reason is in **CFN Events**. Note that hop in your runbook.
 6. Write the four-column table: failure → does CI go red? → where the real error lives → first command.
@@ -1036,11 +1150,11 @@ Rules: break it, then **diagnose starting from CloudWatch and the console only**
 
 **Day 2 — Retries and catchers**
 
-1. Add a `Task` state invoking something that can fail (a small Lambda, or an SDK integration with a bad parameter). Run it.
+1. Add a `Task` state that can fail. The simplest is an SDK integration with a bad parameter: `"Resource": "arn:aws:states:::aws-sdk:s3:getObject"` with `"Parameters": {"Bucket": "no-such-bucket-<acct>", "Key": "x"}`. Run it.
    *Check:* the execution fails and the graph shows the failing state in red.
 2. Open the execution's **Events** view and find the exact error name (e.g. `States.TaskFailed`) and cause.
    *Check:* you can read the input and output of every individual state — this view is the state machine's stack trace.
-3. Add `Retry` with `IntervalSeconds`, `BackoffRate`, `MaxAttempts` on a specific error name.
+3. Add `Retry` with `IntervalSeconds: 2`, `BackoffRate: 2`, `MaxAttempts: 3` on the specific error name you found in step 2 (for this example it will look like `S3.NoSuchBucketException`).
    *Check:* the event history shows multiple attempts with widening gaps.
 4. Add `Catch` routing that error to a `Fail` state with a useful message.
    *Check:* the execution ends in your named failure state, not an unhandled crash.
@@ -1049,25 +1163,27 @@ Rules: break it, then **diagnose starting from CloudWatch and the console only**
 
 **Day 3 — Deploying a stack from the state machine**
 
-1. Add a state that uploads/references your template in the `00-bootstrap` S3 bucket and calls CloudFormation `CreateStack`/`UpdateStack` via the AWS SDK integration.
-   *Check:* a stack actually starts creating when you run an execution.
+1. Build a new state machine whose job is to deploy **`03-compute`**. Its execution input is `{"env": "dev", "sha": "<sha>"}`. Add a state that calls CloudFormation `UpdateStack` via the AWS SDK integration (`arn:aws:states:::aws-sdk:cloudformation:updateStack`). Pass `StackName` built from `env`, `TemplateURL` pointing at `https://<bucket>.s3.amazonaws.com/templates/<sha>/03-compute.yaml` (uploaded by week 10's pipeline), the `EnvName`/`ImageTag` parameters, and `Capabilities: ["CAPABILITY_NAMED_IAM"]`. Use `UpdateStack` only. Your stacks already exist, which keeps the machine simple.
+   *Check:* the stack actually starts updating when you run an execution with a new SHA.
 2. Give the state machine's IAM role only the CloudFormation, S3, and `iam:PassRole` permissions it needs.
    *Check:* an execution fails cleanly with `AccessDenied` if you remove one — and you can tell which.
 3. Add a wait loop: `DescribeStacks` → `Choice` on status → `Wait 30s` → loop, exiting on a terminal status.
    *Check:* the execution stays running until the stack finishes, then completes. **The SDK call returns immediately** — without this loop the machine reports success while the stack is still creating, which is the subtle bug here.
 4. Handle the `UPDATE_COMPLETE` / `CREATE_COMPLETE` / `*_FAILED` / `*_ROLLBACK_COMPLETE` statuses explicitly.
    *Check:* run it against a template you know will fail — the machine detects failure rather than looping forever.
-5. Add a `Wait` cap or `MaxAttempts` so a hung stack can't loop indefinitely.
+5. Add a cap so a hung stack can't loop indefinitely: set `TimeoutSeconds` on the state machine (e.g. 1800), or keep a loop counter in the state and fail after N iterations.
    *Check:* you can state the maximum wall-clock time an execution can take.
+6. Switch the pipeline over: in week 10's `deploy` job, keep running `deploy.sh` for `00`–`02`, but deploy `03-compute` by starting this state machine with `aws stepfunctions start-execution` (input `{"env": ..., "sha": ...}`) and polling `describe-execution` until it finishes. Give `circleci-deploy` the `states:StartExecution` and `states:DescribeExecution` permissions.
+   *Check:* a push to `main` produces a Step Functions execution, and the CI job goes red if the execution fails. This is the "Step Function deploys the stack" line in the capstone checklist.
 
 **Day 4 — Rollback branch and re-runs**
 
 1. Add a failure branch: on a failed stack status, publish to your SNS topic with the stack name and the failure reason.
    *Check:* you receive the email with the actual `ResourceStatusReason`, not a generic message.
-2. Add a rollback action on that branch (`ContinueUpdateRollback`, or delete a failed `CREATE`).
-   *Check:* the stack ends in a recoverable state after a deliberately failed execution.
+2. Add a rollback action on that branch: if the stack status is `UPDATE_ROLLBACK_FAILED`, call `ContinueUpdateRollback`. Otherwise CloudFormation has already rolled back, and the branch just notifies and fails. To test it, run an execution with a SHA that doesn't exist in ECR.
+   *Check:* the stack ends in `UPDATE_ROLLBACK_COMPLETE` (a state you can deploy over) after a deliberately failed execution.
 3. Re-run the same execution input on an already-succeeded stack.
-   *Check:* it succeeds with no changes ("No updates are to be performed" handled gracefully, not treated as failure). That's idempotency — verify it, don't assume it.
+   *Check:* it succeeds with no changes. `UpdateStack` throws a `ValidationError` with the message "No updates are to be performed". `Catch` that error and route it to success instead of failure. That's idempotency — verify it, don't assume it.
 4. In `runbook.md`, list each state as idempotent or not, and what a mid-execution retry would do at each point.
    *Check:* you identified at least one state where a blind retry would be wrong.
 5. Kill an execution halfway and restart it.
@@ -1075,11 +1191,11 @@ Rules: break it, then **diagnose starting from CloudWatch and the console only**
 
 **Day 5 — Scheduled job, properly**
 
-1. Move the week-5 EventBridge schedule into CloudFormation with a `FlexibleTimeWindow` and its own IAM role.
+1. Harden the week-5 schedule in `03-compute.yaml`: set `FlexibleTimeWindow` (`Mode: FLEXIBLE`, `MaximumWindowInMinutes: 5`) and make sure it uses its own scheduler IAM role (shared with nothing else).
    *Check:* the schedule deploys from the template and shows a next-invocation time.
-2. Add an SQS **dead-letter queue** to the schedule's target config.
+2. Add an SQS **dead-letter queue**: an `AWS::SQS::Queue`, referenced from the schedule's `Target.DeadLetterConfig.Arn`. Grant the scheduler role `sqs:SendMessage` on it.
    *Check:* the DLQ exists and is referenced by the schedule.
-3. Break the target (bad task definition ARN) and let it fire.
+3. Break the target (bad task definition ARN) and set the schedule to fire in a couple of minutes.
    *Check:* a message lands in the DLQ. Without this you'd have a job that just silently stops running.
 4. Add a CloudWatch alarm on DLQ `ApproximateNumberOfMessagesVisible` > 0 → SNS.
    *Check:* the alarm fires and you get the email.
@@ -1110,24 +1226,24 @@ Rules: break it, then **diagnose starting from CloudWatch and the console only**
    *Check:* status `Pending validation` with CNAME records shown. (A cert in the wrong region can't attach to your ALB — this catches people.)
 3. Create the validation CNAME records in the hosted zone.
    *Check:* the certificate flips to `Issued` (usually minutes).
-4. Add an HTTPS listener on `:443` to the ALB with the cert, forwarding to your target group.
+4. Add an alias A record for `app.yourdomain.com` pointing at the ALB. Put it in `01-network-edge.yaml` as an `AWS::Route53::RecordSet` with `AliasTarget` = the ALB's `DNSName` and `CanonicalHostedZoneID`.
+   *Check:* `dig app.yourdomain.com` returns the ALB's IPs, and `curl http://app.yourdomain.com/healthz` returns 200.
+5. Add an HTTPS listener on `:443` to the ALB with the cert (pass the cert ARN into `01` as a Parameter), forwarding to your target group.
    *Check:* `curl https://app.yourdomain.com/healthz` returns 200 with a valid chain — no `-k` needed.
-5. Change the `:80` listener to a **redirect** action to `:443` (301).
+6. Change the `:80` listener to a **redirect** action to `:443` (301).
    *Check:* `curl -I http://app.yourdomain.com` returns `301` with an `https://` Location.
-6. Add an alias A record pointing your subdomain at the ALB.
-   *Check:* the domain resolves to the ALB and serves your app.
 
 **Day 2 — WAFv2**
 
-1. Create a WebACL (`AWS::WAFv2::WebACL`, scope `REGIONAL`) with the `AWSManagedRulesCommonRuleSet` managed group in **count** mode first.
+1. In `01-network-edge.yaml`, create a WebACL (`AWS::WAFv2::WebACL`, scope `REGIONAL`, `DefaultAction: Allow`) with the `AWSManagedRulesCommonRuleSet` managed group in **count** mode first (`OverrideAction: { Count: {} }`). Attach it to the ALB with an `AWS::WAFv2::WebACLAssociation`.
    *Check:* it deploys and associates with the ALB without blocking your own traffic.
-2. Send a request that trips a managed rule (e.g. an obvious SQL-injection string in a query parameter).
+2. Send a request that trips a managed rule. The common rule set catches cross-site scripting, so `curl "https://app.yourdomain.com/healthz?q=<script>alert(1)</script>"` works. (SQL injection lives in a *different* group, `AWSManagedRulesSQLiRuleSet`.)
    *Check:* the request still succeeds (count mode) but the rule shows a match in the WAF metrics.
-3. Switch the managed group to **block**.
+3. Switch the managed group to **block** (`OverrideAction: { None: {} }`).
    *Check:* the same request now returns `403` from the ALB, before it ever reaches your task — confirm your app logs show nothing.
 4. Add a rate-limit rule (e.g. 100 requests per 5 minutes per IP).
    *Check:* a `for` loop of curls eventually gets 403s, then recovers after the window.
-5. Enable WAF logging to CloudWatch Logs and find your own blocked request.
+5. Enable WAF logging to CloudWatch Logs (`AWS::WAFv2::LoggingConfiguration`; the log group name **must** start with `aws-waf-logs-`) and find your own blocked request.
    *Check:* you can see the matched rule name and the offending field in the log entry.
 6. Confirm normal traffic is unaffected.
    *Check:* your app still works from a browser. **Ship WAF in count mode first, always** — that's the runbook note.
@@ -1147,9 +1263,9 @@ Rules: break it, then **diagnose starting from CloudWatch and the console only**
 
 **Day 4 — Capstone: full deploy from scratch, by pipeline only**
 
-1. Tear everything down so you start from an empty account.
+1. Tear everything down so you start from an empty account. There are four exceptions, which can't be created by the pipeline that depends on them: the CircleCI OIDC provider and `circleci-deploy` role (week 10), the hosted zone, and the ACM certificate.
    *Check:* zero stacks, zero ALBs, zero databases.
-2. Trigger the pipeline from a **fresh commit** and let it build `00 → 01 → 02 → 03` for `dev`.
+2. Make sure the pipeline can build from nothing. Its deploy job must deploy `00-bootstrap` first, since the ECR repos and template bucket live there, *before* the build job pushes an image. Reorder the jobs if needed: deploy-bootstrap → build → push → deploy-dev. Then trigger the pipeline from a **fresh commit** and let it build `00 → 01 → 02 → 03` for `dev`.
    *Check:* the whole environment comes up **without you running a single AWS CLI command by hand**. Any manual step you had to take is a bug — fix it in the templates or the pipeline and re-run.
 3. Approve the gate and let it deploy `stage`.
    *Check:* two environments, same templates, same image SHA.
@@ -1168,7 +1284,7 @@ Rules: break it, then **diagnose starting from CloudWatch and the console only**
    *Check:* it names Kubernetes, Terraform (week 13), and multi-account — showing the omissions were choices.
 4. Run `./teardown.sh` and verify zero billable resources, including snapshots, Elastic IPs, and log groups.
    *Check:* Cost Explorer trends to ~$0 over the following days (domain registration aside).
-5. Make the repo public and re-read it as a stranger would.
+5. Confirm the repo is still public (you made it public in Prerequisites), then re-read it in a private browser window as a stranger would.
    *Check:* the front page shows diagrams, not a wall of YAML.
 
 **Capstone definition of done** — a single sandbox environment, created only from templates in your repo and deployed only by CircleCI, containing:
